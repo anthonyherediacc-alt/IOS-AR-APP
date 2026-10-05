@@ -1,12 +1,13 @@
 # PROJECT
 
 ## Architecture
-Static ES-module site. Per new camera frame: `createImageBitmap(video)` (one captured frame) → MediaPipe Hand Landmarker (VIDEO, 1 hand, GPU→CPU fallback) → least-squares fit of a fixed 5-point dorsal template (wrist + 4 MCPs) → 3D pose in a pinhole camera (origin, axes, scale; out-of-plane from MediaPipe z) → One Euro filter on the whole pose (one shared cutoff) → dorsal visibility (2D foreshortening + handedness, hysteresis) → WebGL2 draws the SAME captured frame + wound quad (4 hand-local corners projected, perspective-correct, premultiplied alpha, mipmaps, edge feather, partial multiply blend). 2D overlay canvas = debug only. All canvases are video-sized with `object-fit: cover`.
+Static ES-module site. Per new camera frame: `createImageBitmap(video)` (one captured frame) → MediaPipe Hand Landmarker (VIDEO, 1 hand, GPU→CPU fallback) → 1€ filter per palm landmark (MediaPipe smoothing-calculator pattern, reference casiez filter) → MediaPipe face-geometry pipeline ported to hands (perspective unprojection + weighted orthogonal Procrustes vs a 5-point hand canonical model) → dorsal visibility (2D foreshortening + handedness, hysteresis) → WebGL2 draws the SAME captured frame + wound quad (4 hand-local corners projected, perspective-correct, premultiplied alpha, mipmaps, edge feather, partial multiply blend). 2D overlay canvas = debug only. All canvases are video-sized with `object-fit: cover`.
 Wounds are placed in hand-local units (hand widths) on the back of the hand; nothing is stored in screen space.
 
 ## Files
 - `js/config.js` — `WOUNDS` registry, `SETTINGS`, `TRACKING` (filter, focal length, frameSync, visibility), `RENDER` (skinBlend, feather), MediaPipe URLs.
-- `js/handTracker.js` — MediaPipe init, `TEMPLATE`, `getHandPose`, `smoothPose`, `projectLocal`, visibility helpers.
+- `js/handTracker.js` — MediaPipe init, `TEMPLATE` (hand canonical model), `getHandPose` (ported geometry pipeline), `createLandmarkSmoother`, `projectLocal`, visibility helpers.
+- `js/vendor/` — `OneEuroFilter.js`, `svd.js` (unmodified third-party files).
 - `js/woundRenderer.js` — WebGL2 renderer (camera + wound quad), `woundCorners`.
 - `js/app.js` — camera, frame-synced loop, status/errors, debug overlay (raw vs filtered pose).
 - `index.html`, `style.css`, `assets/wounds/*.png` (generated placeholders).
@@ -14,10 +15,23 @@ Wounds are placed in hand-local units (hand widths) on the back of the hand; not
 ## Dependencies
 - `@mediapipe/tasks-vision@1.0.1` from jsDelivr (bundle + wasm); model `hand_landmarker.task` (float16/1) from Google storage. Requires network on first load.
 
+## External implementations used
+| Project | URL | License | Component used | Local file |
+|---|---|---|---|---|
+| MediaPipe face geometry | https://github.com/google-ai-edge/mediapipe/blob/master/mediapipe/tasks/cc/vision/face_geometry/libs/geometry_pipeline.cc | Apache-2.0 | `ScreenToMetricSpaceConverter::Convert` (project → 2-pass scale → unproject → pose), ported to JS with a hand canonical model | `js/handTracker.js` (`getHandPose`, `unproject`) |
+| MediaPipe Procrustes solver | https://github.com/google-ai-edge/mediapipe/blob/master/mediapipe/tasks/cc/vision/face_geometry/libs/procrustes_solver.cc | Apache-2.0 | `InternalSolveWeightedOrthogonalProblem` (weighted orthogonal Procrustes, eqs. 51–54), ported | `js/handTracker.js` (`solveWeightedOrthogonal`) |
+| MediaPipe landmark smoothing | https://github.com/google-ai-edge/mediapipe/blob/master/mediapipe/calculators/util/landmarks_smoothing_calculator_utils.cc | Apache-2.0 | Per-axis 1€ filtering with value scale = 1/object scale (bbox (w+h)/2) | `js/handTracker.js` (`createLandmarkSmoother`) |
+| 1€ filter reference (Casiez) | https://github.com/casiez/OneEuroFilter (javascript/OneEuroFilter.js) | BSD-3-Clause | `OneEuroFilter` class, unmodified | `js/vendor/OneEuroFilter.js` |
+| svd-js | https://github.com/danilosalvati/svd-js (src/svd.js, v1.1.1) | MIT | Golub–Reinsch SVD for the Procrustes rotation, unmodified | `js/vendor/svd.js` |
+| MediaPipe Tasks Vision | https://www.npmjs.com/package/@mediapipe/tasks-vision | Apache-2.0 | HandLandmarker, DrawingUtils (CDN) | `js/handTracker.js`, `js/app.js` |
+
+Rejected: js-aruco `svd.js` (port of Numerical Recipes `svdcmp`; NR license is restrictive). MANO hand mesh (non-commercial).
+
 ## Findings (tested on MediaPipe sample photos)
 - Handedness label is correct for un-mirrored frames (no inversion needed).
 - `worldLandmarks` are NOT camera-aligned and squash palm width on dorsal views → unused.
 - Normalized landmarks with z give correct proportions and dorsal/palm sign (18/18 incl. mirrored).
+- B1/B2 A/B on the harness (noise 1.5 px): ported Procrustes pose cut static size jitter 1.53→0.90 % hw and fast-pan skew 2.9°→1.0°, but synthetic-yaw size error rose 2.4→5.5 %; landmark 1€ (0.3/40/3) beat the old custom shared-cutoff pose filter on every position metric. MediaPipe's own pose params (0.05/80/1) lagged on fast pans (max 7.4 %).
 - Floating was mainly (1) per-component One Euro lag (up to 32% hand width) and (2) live <video> running ahead of the overlay. Synthetic-sequence harness (known homographies + noise) was used to measure; template fit residual is a constant ~4% hw, so a curved mesh adds nothing.
 
 ## Safari constraints
@@ -25,12 +39,13 @@ Wounds are placed in hand-local units (hand widths) on the back of the hand; not
 - Feature-detected: secure context, `mediaDevices.getUserMedia`, WebAssembly.
 
 ## Working (headless Chromium: sample photos + synthetic motion sequences)
-Frame-synced compositing, template-fit dorsal pose, shared-cutoff One Euro, perspective-correct WebGL quad, dorsal-only visibility with hysteresis, edge feather + skin blend, debug (patch, template fit, raw vs filtered axes/normal/quad, facing, speed, inference ms), error messages.
+Frame-synced compositing, ported MediaPipe Procrustes pose, landmark 1€ smoothing, perspective-correct WebGL quad, dorsal-only visibility with hysteresis, edge feather + skin blend, debug (patch, template fit, raw vs filtered axes/normal/quad, facing, speed, inference ms), error messages.
 
 ## Bugs / unverified
 - Not yet tested on a real iPhone (frame-capture cost, GPU delegate, filter tuning, real jitter).
 - No occlusion (other hand/objects pass under the wound). Next step if needed.
 - Focal length is an assumed constant (0.75 × long side); only affects the small perspective term.
+- Rigid pose relies on MediaPipe z for yaw/pitch; synthetic yaw shows up to 13 % width error (unverified on a real hand).
 
 ## Next task
 Real-iPhone test of surface lock; then occlusion (if needed) and control panel.

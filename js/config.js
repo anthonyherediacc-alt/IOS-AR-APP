@@ -35,10 +35,10 @@ export const SETTINGS = {
 };
 
 export const TRACKING = {
-  // One Euro filter on the whole hand frame. Speeds are in hand widths per second.
-  minCutoff: 1.0, // Hz when still: lower = steadier
-  beta: 12, // cutoff increase per hand-width/s: higher = less lag when moving
-  dCutoff: 3.0, // Hz, smoothing of the speed estimate (higher = reacts faster when motion starts)
+  // 1€ filter on each palm landmark, MediaPipe LandmarksSmoothingCalculator style (speed measured in
+  // hand sizes/s). Lower minCutoff = steadier when still; higher beta = less lag when moving.
+  // Tuned on the synthetic-motion harness (MediaPipe's pose values 0.05/80/1 lagged on fast moves).
+  landmarkFilter: { minCutoff: 0.3, beta: 40, dCutoff: 3 },
   focalLength: 0.75, // camera focal length ÷ video long side (iPhone main camera ≈ 0.75)
   frameSync: true, // track and display the same captured frame (overlay can't lag the video)
   // facing = cos(angle between back-of-hand normal and camera direction); 1 = back faces camera.

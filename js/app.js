@@ -1,7 +1,7 @@
 import { WOUNDS, SETTINGS, TRACKING, RENDER } from "./config.js";
 import {
-  vision, createHandLandmarker, createPose, getHandPose, smoothPose, projectLocal, getDorsalVisibility, getFacingLabel,
-  TEMPLATE,
+  vision, createHandLandmarker, createPose, getHandPose, createLandmarkSmoother, projectLocal, getDorsalVisibility,
+  getFacingLabel, TEMPLATE,
 } from "./handTracker.js";
 import { createRenderer, loadWoundImage, woundCorners } from "./woundRenderer.js";
 
@@ -9,7 +9,8 @@ const $ = (id) => document.getElementById(id);
 const video = $("video"), view = $("view"), canvas = $("overlay"), ctx = canvas.getContext("2d");
 const statusEl = $("status"), debugEl = $("debugInfo"), startBtn = $("start");
 
-const raw = createPose(), smoothed = createPose();
+const raw = createPose(), pose = createPose(); // pose = from smoothed landmarks (rendered); raw = debug only
+const smoother = createLandmarkSmoother(TRACKING.landmarkFilter);
 const cam = { f: 1, cx: 0, cy: 0 }; // pinhole intrinsics in video pixels
 const visibility = { visible: false };
 let lockedRight = null; // handedness locked for the current track, so it can't flip near edge-on
@@ -138,7 +139,7 @@ async function processFrame() {
   if (!lm || !hd) {
     // Hide the wound. Its placement is hand-local config, so it reappears in the same spot on
     // the hand when tracking returns; the filter restarts so it doesn't slide in from the old pose.
-    smoothed.valid = false;
+    smoother.reset();
     visibility.visible = false;
     lockedRight = null;
     setStatus("Show your hand to the camera.");
@@ -147,11 +148,11 @@ async function processFrame() {
     if (statusEl.textContent) setStatus("");
     if (lockedRight === null && hd.score >= TRACKING.handednessMinScore) lockedRight = hd.categoryName === "Right";
     const isRight = lockedRight ?? hd.categoryName === "Right";
-    if (getHandPose(lm, isRight, w, h, cam, raw)) {
-      smoothPose(smoothed, raw, TRACKING, now);
-      const alpha = getDorsalVisibility(visibility, smoothed.facing, TRACKING);
-      renderer.drawWound(currentWound(), smoothed, cam, alpha, RENDER);
-      if (SETTINGS.debug) drawDebug(lm, hd, isRight, alpha);
+    // Smooth the landmarks, then solve the pose once from them (MediaPipe's order of operations).
+    if (getHandPose(smoother.apply(lm, w, h, now / 1000), isRight, w, h, cam, pose)) {
+      const alpha = getDorsalVisibility(visibility, pose.facing, TRACKING);
+      renderer.drawWound(currentWound(), pose, cam, alpha, RENDER);
+      if (SETTINGS.debug && getHandPose(lm, isRight, w, h, cam, raw)) drawDebug(lm, hd, isRight, alpha);
     }
   }
   updateFps();
@@ -197,18 +198,17 @@ function drawDebug(lm, hd, isRight, alpha) {
     const a = lm[patch[k]], b = lm[patch[(k + 1) % 5]];
     line(a.x * w, a.y * h, b.x * w, b.y * h, "rgba(255,255,255,.7)", 2);
   }
-  for (const [u, v] of TEMPLATE) { projectLocal(smoothed, cam, u * smoothed.indexSide, v, dbg, 0); dot(dbg[0], dbg[1], 5, "#fff"); }
+  for (const [u, v] of TEMPLATE) { projectLocal(pose, cam, u * pose.indexSide, v, dbg, 0); dot(dbg[0], dbg[1], 5, "#fff"); }
   // Raw pose: thin; filtered pose: thick. If thick follows thin with a gap, it's filter lag;
   // if both wander off the skin, it's the tracker.
   drawFrame(raw, 1, 0.6);
   drawQuad(raw, "#f0f", 1);
-  drawFrame(smoothed, 4, 0.6);
-  drawQuad(smoothed, "#ff0", 3);
-  projectLocal(smoothed, cam, 0, 0, dbg, 0);
+  drawFrame(pose, 4, 0.6);
+  drawQuad(pose, "#ff0", 3);
+  projectLocal(pose, cam, 0, 0, dbg, 0);
   dot(dbg[0], dbg[1], 6, "#ff0");
   debugEl.textContent = `${fps} fps · ${inferMs | 0} ms · ${isRight ? "right" : "left"} hand (${(hd.score * 100) | 0}%) · ` +
-    `${getFacingLabel(smoothed.facing, TRACKING)} · facing ${smoothed.facing.toFixed(2)} · α ${alpha.toFixed(2)} · ` +
-    `${smoothed.speed.toFixed(1)} hw/s`;
+    `${getFacingLabel(pose.facing, TRACKING)} · facing ${pose.facing.toFixed(2)} · α ${alpha.toFixed(2)}`;
 }
 
 function updateFps() {
