@@ -4,7 +4,7 @@ import SwiftUI
 
 @main
 struct WoundARApp: App {
-    var body: some Scene {
+    var body: some SwiftUI.Scene { // RealityKit also has a type named Scene
         WindowGroup { ContentView() }
     }
 }
