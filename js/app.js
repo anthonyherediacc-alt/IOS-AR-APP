@@ -11,7 +11,7 @@ const video = $("video"), view = $("view"), canvas = $("overlay"), ctx = canvas.
 const statusEl = $("status"), debugEl = $("debugInfo"), startBtn = $("start");
 
 const raw = createPose(), pose = createPose(); // pose = from smoothed landmarks (rendered); raw = debug only
-const smoother = createLandmarkSmoother(TRACKING.landmarkFilter);
+const smoother = createLandmarkSmoother(TRACKING);
 const cam = { f: 1, cx: 0, cy: 0 }; // pinhole intrinsics in video pixels
 const visibility = { visible: false };
 let lockedRight = null; // handedness locked for the current track, so it can't flip near edge-on

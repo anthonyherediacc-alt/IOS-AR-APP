@@ -1,7 +1,7 @@
 # PROJECT
 
 ## Architecture
-Static ES-module site. Per new camera frame: `createImageBitmap(video)` (one captured frame) → MediaPipe Hand Landmarker (VIDEO, 1 hand, GPU→CPU fallback) → 1€ filter per palm landmark (MediaPipe smoothing-calculator pattern, reference casiez filter) → MediaPipe face-geometry pipeline ported to hands (perspective unprojection + weighted orthogonal Procrustes vs a 5-point hand canonical model) → dorsal visibility (2D foreshortening + handedness, hysteresis) → Three.js draws the SAME captured frame (background quad) + the wound as a lit 3D plane (MeshStandardMaterial, optional height/bump map) posed with the hand frame, lifted `RENDER.surfaceOffset` along the dorsal normal from the joint plane onto the skin, perspective camera matching the pinhole model. 2D overlay canvas = debug only. All canvases are video-sized with `object-fit: cover`.
+Static ES-module site. Per new camera frame: `createImageBitmap(video)` (one captured frame) → MediaPipe Hand Landmarker (VIDEO, 1 hand, GPU→CPU fallback) → 1€ filter per palm landmark (MediaPipe smoothing-calculator pattern, reference casiez filter; `TRACKING.steadiness` blends responsive↔steady params) → MediaPipe face-geometry pipeline ported to hands (perspective unprojection + weighted orthogonal Procrustes vs a 5-point hand canonical model) → dorsal visibility (2D foreshortening + handedness, hysteresis) → Three.js draws the SAME captured frame (background quad) + the wound as a lit 3D plane (MeshStandardMaterial, optional height/bump map) posed with the hand frame, lifted `RENDER.surfaceOffset` along the dorsal normal from the joint plane onto the skin, perspective camera matching the pinhole model. 2D overlay canvas = debug only. All canvases are video-sized with `object-fit: cover`.
 Wounds are placed in hand-local units (hand widths) on the back of the hand; nothing is stored in screen space.
 
 ## Files
@@ -10,7 +10,7 @@ Wounds are placed in hand-local units (hand widths) on the back of the hand; not
 - `js/vendor/` — `OneEuroFilter.js`, `svd.js` (unmodified third-party files).
 - `js/woundRenderer.js` — Three.js scene (camera background + lit wound plane), `woundCorners` (debug).
 - `js/app.js` — camera, frame-synced loop, status/errors, debug overlay (raw vs filtered pose).
-- `js/controls.js` — side panel: sideways/up-down/size sliders (edit the active wound live), user picture (object URL → temporary wound entry), reset to config defaults.
+- `js/controls.js` — side panel: sideways/up-down/size/steadiness sliders (edit the active wound live), user picture (object URL → temporary wound entry), reset to config defaults.
 - `index.html`, `style.css`, `assets/wounds/*.png` (generated placeholders).
 
 ## Dependencies
@@ -35,6 +35,7 @@ Rejected: js-aruco `svd.js` (port of Numerical Recipes `svdcmp`; NR license is r
 - `worldLandmarks` are NOT camera-aligned and squash palm width on dorsal views → unused.
 - Normalized landmarks with z give correct proportions and dorsal/palm sign (18/18 incl. mirrored).
 - B1/B2 A/B on the harness (noise 1.5 px): ported Procrustes pose cut static size jitter 1.53→0.90 % hw and fast-pan skew 2.9°→1.0°, but synthetic-yaw size error rose 2.4→5.5 %; landmark 1€ (0.3/40/3) beat the old custom shared-cutoff pose filter on every position metric. MediaPipe's own pose params (0.05/80/1) lagged on fast pans (max 7.4 %).
+- Still-hand jitter: at webcam-like noise (3–5 px/landmark) the 0.3/40/3 filter removed little (noise read as motion). Default steadiness 0.6 (≈0.1/10/2) halves static jitter and tilt wobble; costs more lag on very fast moves (max ~11 % hw). MediaPipe's RelativeVelocityFilter (window 5, scale 10) was ported and A/B'd: no better than 1€ at equal lag → not kept.
 - Wound looked "inside the hand": landmarks are joint centres (~1 cm under dorsal skin); fixed by lifting along the normal (`surfaceOffset`).
 - Floating was mainly (1) per-component One Euro lag (up to 32% hand width) and (2) live <video> running ahead of the overlay. Synthetic-sequence harness (known homographies + noise) was used to measure; template fit residual is a constant ~4% hw, so a curved mesh adds nothing.
 

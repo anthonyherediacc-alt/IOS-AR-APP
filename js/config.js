@@ -30,7 +30,7 @@ export const WOUNDS = [
     opacity: 0.95,
     height: "./assets/wounds/laceration-height.png",
     heightScale: 2,
-    roughness: 0.35,
+    roughness: 0.5, // a sharper highlight turns tiny tilt jitter into visible flicker
   },
 ];
 
@@ -41,9 +41,14 @@ export const SETTINGS = {
 
 export const TRACKING = {
   // 1€ filter on each palm landmark, MediaPipe LandmarksSmoothingCalculator style (speed measured in
-  // hand sizes/s). Lower minCutoff = steadier when still; higher beta = less lag when moving.
-  // Tuned on the synthetic-motion harness (MediaPipe's pose values 0.05/80/1 lagged on fast moves).
-  landmarkFilter: { minCutoff: 0.3, beta: 40, dCutoff: 3 },
+  // hand sizes/s). steadiness 0..1 blends between the two settings (Adjust panel slider).
+  // 0.6 ≈ minCutoff 0.1 / beta 10 / dCutoff 2: half the still-hand jitter of "responsive" on the
+  // harness, at the cost of more lag on very fast moves.
+  steadiness: 0.6,
+  filterRange: {
+    responsive: { minCutoff: 0.3, beta: 40, dCutoff: 3 },
+    steady: { minCutoff: 0.05, beta: 5, dCutoff: 1 },
+  },
   focalLength: 0.75, // camera focal length ÷ video long side (iPhone main camera ≈ 0.75)
   frameSync: true, // track and display the same captured frame (overlay can't lag the video)
   // facing = cos(angle between back-of-hand normal and camera direction); 1 = back faces camera.

@@ -138,8 +138,11 @@ export function getHandPose(lm, isRight, w, h, cam, out) {
 // Every axis of every palm landmark goes through the reference 1€ filter (casiez, vendored). As in
 // MediaPipe, the speed term is scaled by 1/object size (bbox (w+h)/2 of all landmarks) so smoothing is
 // the same at any distance; with a linear low-pass that equals dividing beta by the object size.
+// cfg.steadiness (0..1) picks parameters between cfg.filterRange.responsive and .steady (log scale),
+// read every frame so the Adjust panel can change it live.
+const lerpLog = (a, b, t) => a * (b / a) ** t;
 export function createLandmarkSmoother(cfg) {
-  const filters = PALM.map(() => [0, 1, 2].map(() => new OneEuroFilter(30, cfg.minCutoff, cfg.beta, cfg.dCutoff)));
+  const filters = PALM.map(() => [0, 1, 2].map(() => new OneEuroFilter(30)));
   const out = new Array(21);
   for (const i of PALM) out[i] = { x: 0, y: 0, z: 0 };
   return {
@@ -147,12 +150,14 @@ export function createLandmarkSmoother(cfg) {
     reset() { for (const f of filters) for (const a of f) a.reset(); },
     // lm: 21 normalized landmarks; tSec: timestamp in seconds. Returns smoothed palm landmarks (sparse).
     apply(lm, w, h, tSec) {
+      const { responsive: r, steady: s } = cfg.filterRange, t = cfg.steadiness;
+      const minCutoff = lerpLog(r.minCutoff, s.minCutoff, t), dCutoff = lerpLog(r.dCutoff, s.dCutoff, t);
       let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
       for (const p of lm) { x0 = Math.min(x0, p.x * w); x1 = Math.max(x1, p.x * w); y0 = Math.min(y0, p.y * h); y1 = Math.max(y1, p.y * h); }
-      const beta = cfg.beta / Math.max(1e-6, (x1 - x0 + y1 - y0) / 2);
+      const beta = lerpLog(r.beta, s.beta, t) / Math.max(1e-6, (x1 - x0 + y1 - y0) / 2);
       for (let k = 0; k < NP; k++) {
         const p = lm[PALM[k]], f = filters[k], o = out[PALM[k]];
-        f[0].setBeta(beta); f[1].setBeta(beta); f[2].setBeta(beta);
+        for (const a of f) { a.setMinCutoff(minCutoff); a.setBeta(beta); a.setDerivateCutoff(dCutoff); }
         o.x = f[0].filter(p.x * w, tSec) / w; o.y = f[1].filter(p.y * h, tSec) / h; o.z = f[2].filter(p.z * w, tSec) / w;
       }
       return out;

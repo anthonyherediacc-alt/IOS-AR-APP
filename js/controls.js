@@ -1,8 +1,8 @@
-import { WOUNDS, SETTINGS } from "./config.js";
+import { WOUNDS, SETTINGS, TRACKING } from "./config.js";
 
-// Side panel: live position/size offsets, a user-supplied picture, and reset to the config defaults.
+// Side panel: live position/size offsets, steadiness, a user-supplied picture, and reset to defaults.
 // Edits the active wound entry in place; the renderer reads it every frame.
-const DEFAULTS = { woundId: SETTINGS.woundId, wounds: WOUNDS.map((w) => ({ ...w })) };
+const DEFAULTS = { woundId: SETTINGS.woundId, wounds: WOUNDS.map((w) => ({ ...w })), steadiness: TRACKING.steadiness };
 const FIELDS = { ctlX: "xOffset", ctlY: "yOffset", ctlScale: "scale" };
 let customCount = 0;
 
@@ -15,7 +15,11 @@ export function initControls(currentWound, showError) {
     toggle.setAttribute("aria-expanded", String(!panel.hidden));
   });
 
-  const sync = () => { for (const [id, key] of Object.entries(FIELDS)) $(id).value = currentWound()[key]; };
+  const sync = () => {
+    for (const [id, key] of Object.entries(FIELDS)) $(id).value = currentWound()[key];
+    $("ctlSteady").value = TRACKING.steadiness;
+  };
+  $("ctlSteady").addEventListener("input", (e) => { TRACKING.steadiness = Number(e.target.value); });
   for (const [id, key] of Object.entries(FIELDS)) {
     $(id).addEventListener("input", (e) => { currentWound()[key] = Number(e.target.value); });
   }
@@ -44,6 +48,7 @@ export function initControls(currentWound, showError) {
     removeCustom();
     DEFAULTS.wounds.forEach((d, i) => Object.assign(WOUNDS[i], d));
     SETTINGS.woundId = DEFAULTS.woundId;
+    TRACKING.steadiness = DEFAULTS.steadiness;
     file.value = "";
     sync();
   });
