@@ -33,7 +33,8 @@ struct DebugInfo {
 }
 
 private enum Tracking {
-    static let forgetAfter: TimeInterval = 0.7 // keep the hand's identity through brief detection drops
+    static let forgetAfter: TimeInterval = 0.7 // keep the hand's identity through brief detection drops…
+    static let coveredMemory: TimeInterval = 5 // …longer while another hand lies where the wound hand was (covering it)
     static let maxJump: Float = 2 // a hand this many hand widths from the last one is a different hand
     static let facingHysteresis: Float = 0.15 // back/palm only flips once clearly past edge-on
     static let lostAt: Float = 0.35 // skin mesh and joints this far apart (hand widths)…
@@ -50,6 +51,22 @@ private let segS = 12, segT = 30 // render mesh resolution (across, along the wo
 private func ramp(_ a: Float, _ b: Float, _ x: Float) -> Float {
     let t = min(max((x - a) / (b - a), 0), 1)
     return t * t * (3 - 2 * t)
+}
+
+// True if p (camera-image pixels) lies inside one of the capsules (within its radius of the segment).
+private func coveredByCapsules(_ p: SIMD2<Float>, _ capsules: [Capsule]) -> Bool {
+    for c in capsules {
+        let a = SIMD2<Float>(c.ends.x, c.ends.y)
+        let b = SIMD2<Float>(c.ends.z, c.ends.w)
+        let ab: SIMD2<Float> = b - a
+        let ap: SIMD2<Float> = p - a
+        let length2: Float = max(simd_dot(ab, ab), 1e-6)
+        let along: Float = simd_dot(ap, ab) / length2
+        let h: Float = min(max(along, 0), 1)
+        let closest: SIMD2<Float> = a + ab * h
+        if simd_distance(p, closest) < c.params.x { return true }
+    }
+    return false
 }
 
 // Pipeline (vision queue, one camera frame at a time):
@@ -88,6 +105,12 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
     private var lastCentroid: SIMD2<Float>?
     private var lastHandSize: Float = 1
     private var lastSeen: TimeInterval = 0
+    private var lastCovered: TimeInterval = 0 // last frame another hand was rejected where the wound hand was
+    private var lastJoints: [SIMD2<Float>] = [] // the wound hand's joints when it was last picked (pixels)
+    private var lastHandDepth: Float? // LiDAR depth at the wound joints, the last frame Vision saw the hand
+    private var bridgeConfidence: Float = 0 // last frame's confidence: without Vision it may only fall
+    private var lumaSeeded = false
+    private var frameCount = 0 // RenderFrame ids
     private var lastTime: TimeInterval = 0
     private var dorsal: Bool?
     private var trackerLeft = false
@@ -163,6 +186,7 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
 
     private func process(image: CVPixelBuffer, depth: CVPixelBuffer?, time: TimeInterval,
                          settings: WoundSettings) -> Output {
+        let clock = Date()
         let size = SIMD2<Float>(Float(CVPixelBufferGetWidth(image)), Float(CVPixelBufferGetHeight(image)))
         imageSize = size
         let dt = Float(min(max(time - lastTime, 0), 0.1))
@@ -178,6 +202,13 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
         let before = previousPyramid
         previousPyramid = pyramid
         let options = SurfaceTracker.Options(skinLock: settings.skinLock, deformable: settings.deformable)
+        // A tracked skin point well behind where the hand was (LiDAR) has landed on the background, not on skin.
+        let handReference = lastHandDepth
+        let offSkin: (SIMD2<Float>) -> Bool = { p in
+            guard settings.depthOcclusion, let ref = handReference,
+                  let d = WoundSession.medianDepth(depth, at: [p], size: size) else { return false }
+            return d > ref + 0.05
+        }
 
         var status = ""
         var confidence: Float = 0
@@ -191,6 +222,8 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
             let (hand, pts) = picked
             lastSeen = time
             lastCentroid = pts.reduce(SIMD2<Float>()) { $0 + $1 } / Float(pts.count)
+            lastJoints = pts
+            if let d = WoundSession.medianDepth(depth, at: pts, size: size) { lastHandDepth = d }
             // Hand size robust to rolling (knuckle span shrinks) and pitching (wrist–knuckle length shrinks).
             handSize = max(simd_distance(pts[1], pts[4]), simd_distance(pts[0], pts[2]) / 1.34, 1)
             lastHandSize = handSize
@@ -229,13 +262,15 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
                 if tracker.nodes == nil {
                     tracker.start(anchor: anchor, placement: placement, sgn: sgn)
                     disagreeing = 0
+                    lumaSeeded = false
                     opacity = 0 // (re)acquire: fade in on the intended spot, never snap into view
                     confidence = 1
                 } else {
                     tracker.update(anchor: anchor, placement: placement, sgn: sgn, before: before, now: pyramid,
-                                   options: options, dt: dt, isOffSkin: { _ in false })
-                    confidence = tracker.followingSkin || !settings.skinLock
-                        ? (settings.skinLock ? tracker.flowConfidence : 1) : Tracking.jointsOnlyConfidence
+                                   options: options, dt: dt, isOffSkin: offSkin)
+                    // Joints present: never less visible than joints alone (more tracked skin must not hide it).
+                    let skinConfidence: Float = tracker.followingSkin ? tracker.flowConfidence : 0
+                    confidence = settings.skinLock ? max(skinConfidence, Tracking.jointsOnlyConfidence) : 1
                 }
                 // Skin mesh and joints disagree badly: fade out, then re-acquire from the joints.
                 if let centre = tracker.point(s: 0, t: 0) {
@@ -246,6 +281,7 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
                         if opacity < 0.05 {
                             tracker.start(anchor: anchor, placement: placement, sgn: sgn)
                             disagreeing = 0
+                            lumaSeeded = false
                         }
                     }
                 }
@@ -253,13 +289,20 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
         } else if tracker.nodes != nil, time - lastSeen < Tracking.forgetAfter, dorsal == true, settings.skinLock {
             // Vision missed the hand this frame: keep following the skin alone (fades if that fails too).
             tracker.update(anchor: nil, placement: placement, sgn: sgn, before: before, now: pyramid,
-                           options: options, dt: dt, isOffSkin: { _ in false })
-            confidence = tracker.followingSkin ? tracker.flowConfidence : 0
+                           options: options, dt: dt, isOffSkin: offSkin)
+            // Without Vision confidence may only fall: skin "found" on the background can't bring the wound back,
+            // and a mesh already judged lost keeps fading until the joints re-acquire it.
+            let skin: Float = tracker.followingSkin && disagreeing < Tracking.lostFrames ? tracker.flowConfidence : 0
+            confidence = min(skin, bridgeConfidence)
         } else {
-            if time - lastSeen > Tracking.forgetAfter { reset() }
+            // While another hand covers the wound hand, keep its identity (side, last position) longer, so the
+            // covering hand can't inherit the wound once the short memory runs out.
+            let memory = time - lastCovered < Tracking.forgetAfter ? Tracking.coveredMemory : Tracking.forgetAfter
+            if time - lastSeen > memory { reset() }
             status = "Show the back of your hand."
             if opacity < 0.05 { tracker.reset() }
         }
+        bridgeConfidence = confidence
 
         // Confidence → opacity. Partly tracked skin, or a surface turning edge-on, fades; nothing ever jumps.
         let affine = tracker.affine(placement: placement, sgn: sgn)
@@ -277,10 +320,14 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
         if settings.debug {
             fillDebug(&info, sgn: sgn, anchor: anchor, rawAnchor: rawAnchor, affine: affine, confidence: confidence,
                       foreshortening: foreshortening, handSize: handSize)
+            let ms = Date().timeIntervalSince(clock) * 1000
+            let fps = dt > 0 ? 1 / Double(dt) : 0
+            info.lines.append(String(format: "processing %.1f ms  %.0f fps", ms, fps))
         }
-        let frame = RenderFrame(image: image, vertices: mesh?.vertices ?? [], indices: mesh?.indices ?? [],
-                                opacity: mesh == nil ? 0 : opacity, referenceLuma: referenceLuma,
-                                capsules: mesh?.capsules ?? [])
+        frameCount += 1
+        let frame = RenderFrame(id: frameCount, image: image, vertices: mesh?.vertices ?? [],
+                                indices: mesh?.indices ?? [], opacity: mesh == nil ? 0 : opacity,
+                                referenceLuma: referenceLuma, capsules: mesh?.capsules ?? [])
         return Output(frame: frame, status: status, debug: settings.debug ? info : nil)
     }
 
@@ -311,7 +358,13 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
                 let sampler = DepthSampler(base: UnsafeRawPointer(base), width: CVPixelBufferGetWidth(depth),
                                            height: CVPixelBufferGetHeight(depth),
                                            rowBytes: CVPixelBufferGetBytesPerRow(depth), imageSize: size)
-                let handDepths = (tracker.nodes ?? []).compactMap { sampler.depth(at: $0) }.sorted()
+                // Hand depth only from nodes the other hand does not cover (else a hand hovering over most of the grid
+                // becomes "the hand" and the still-visible wound reads as past the hand's edge).
+                let allNodes: [SIMD2<Float>] = tracker.nodes ?? []
+                let occluders: [Capsule] = other?.capsules ?? []
+                let uncovered: [SIMD2<Float>] = allNodes.filter { !coveredByCapsules($0, occluders) }
+                let depthNodes: [SIMD2<Float>] = uncovered.count >= 5 ? uncovered : allNodes
+                let handDepths = depthNodes.compactMap { sampler.depth(at: $0) }.sorted()
                 let handDepth: Float? = handDepths.isEmpty ? nil : handDepths[handDepths.count / 2]
                 if settings.depthOcclusion, let handDepth {
                     let anchors = woundJoints.compactMap { p in sampler.depth(at: p).map { (p, $0) } }
@@ -353,7 +406,10 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
         }
 
         // Skin brightness around the wound: reference for the shading transfer in the shader.
-        if let luma = meanLuma(image, at: tracker.nodes ?? []) { referenceLuma += 0.2 * (luma - referenceLuma) }
+        if let luma = meanLuma(image, at: tracker.nodes ?? []) {
+            referenceLuma = lumaSeeded ? referenceLuma + 0.2 * (luma - referenceLuma) : luma
+            lumaSeeded = true
+        }
 
         let capsules = settings.handOcclusion && !otherBehind ? (other?.capsules ?? []) : []
         info.capsules = capsules
@@ -376,7 +432,9 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
 
     // The non-wound hand as soft capsules (finger bones, palm), in camera-image pixels.
     private func otherHand(_ hands: [VNHumanHandPoseObservation], picked: VNHumanHandPoseObservation?) -> OtherHand? {
-        guard let other = hands.first(where: { $0 !== picked }),
+        // No wound hand picked this frame (a joint dipped): the wound hand itself may still be in `hands`, and its own
+        // palm must never cover its wound.
+        guard let other = hands.first(where: { $0 !== picked && (picked != nil || !isWoundHand($0)) }),
               let all = try? other.recognizedPoints(.all) else { return nil }
         let size = imageSize
         func p(_ name: VNHumanHandPoseObservation.JointName) -> SIMD2<Float>? {
@@ -418,7 +476,16 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
                 let c = pts.reduce(SIMD2<Float>()) { $0 + $1 } / Float(pts.count)
                 score += simd_distance(c, last) / lastHandSize
             }
-            if leftVotes != 0, hand.chirality == (leftVotes > 0 ? .right : .left) { score += 1 }
+            if leftVotes != 0, hand.chirality == (leftVotes > 0 ? .right : .left) {
+                // Opposite label on an established track: the other hand (e.g. covering this one), unless it shows
+                // its back as the wound hand does and its joints put the wound where the skin grid already is (a
+                // label flip of the wound hand).
+                if abs(leftVotes) >= 5, !(showsBack(pts, left: leftVotes > 0) && matchesTrack(hand)) {
+                    if score <= Tracking.maxJump { lastCovered = lastTime } // lastTime = this frame's time
+                    continue
+                }
+                score += 1
+            }
             if score < bestScore {
                 best = (hand, pts)
                 bestScore = score
@@ -437,8 +504,63 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
         return pts
     }
 
+    // The back/palm test of process() for the given side: false only when the hand clearly shows its palm (the
+    // other hand's back reads as a palm on this side).
+    private func showsBack(_ pts: [SIMD2<Float>], left: Bool) -> Bool {
+        let lateral = pts[1] - pts[4]
+        let forward = (pts[1] + pts[2] + pts[3] + pts[4]) / 4 - pts[0]
+        let cross = (lateral.x * forward.y - lateral.y * forward.x) / max(simd_length(lateral) * simd_length(forward), 1)
+        let score = left ? -cross : cross
+        return score > -Tracking.facingHysteresis
+    }
+
+    // Whether this observation is the tracked wound hand: its joints (any confidence) put the wound centre where
+    // the skin grid's centre is. True for the wound hand with a weak joint or a flipped left/right label.
+    private func matchesTrack(_ hand: VNHumanHandPoseObservation) -> Bool {
+        guard let centre = tracker.point(s: 0, t: 0) else { return false }
+        let sgn: Float = trackerLeft ? 1 : -1
+        var src: [SIMD2<Float>] = [], dst: [SIMD2<Float>] = []
+        for (k, name) in joints.enumerated() {
+            guard let p = try? hand.recognizedPoint(name), p.confidence > 0.05 else { continue }
+            src.append(SIMD2<Float>(handTemplate[k].x * sgn, handTemplate[k].y))
+            dst.append(SIMD2<Float>(Float(p.location.x) * imageSize.x, (1 - Float(p.location.y)) * imageSize.y))
+        }
+        guard let a = Affine2D.fit(src, dst) else { return false }
+        let wanted = a.apply(placement.templatePoint(s: 0, t: 0, sgn: sgn))
+        return simd_distance(wanted, centre) < Tracking.lostAt * lastHandSize
+    }
+
+    // Vision found the wound hand but it was not picked (a joint under the confidence cut-off): its confident
+    // joints are still where the wound hand's joints were last seen. A hand laid over the wound has them elsewhere.
+    private func isWoundHand(_ hand: VNHumanHandPoseObservation) -> Bool {
+        guard lastJoints.count == joints.count else { return false }
+        var total: Float = 0
+        var count = 0
+        for (k, name) in joints.enumerated() {
+            guard let p = try? hand.recognizedPoint(name), p.confidence > 0.3 else { continue }
+            let q = SIMD2<Float>(Float(p.location.x) * imageSize.x, (1 - Float(p.location.y)) * imageSize.y)
+            total += simd_distance(q, lastJoints[k])
+            count += 1
+        }
+        return count >= 2 && total / Float(count) < 0.4 * lastHandSize
+    }
+
+    // Median LiDAR depth (metres) at camera-image pixels; nil without depth.
+    private static func medianDepth(_ depth: CVPixelBuffer?, at pts: [SIMD2<Float>], size: SIMD2<Float>) -> Float? {
+        guard let depth else { return nil }
+        CVPixelBufferLockBaseAddress(depth, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depth, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(depth) else { return nil }
+        let sampler = DepthSampler(base: UnsafeRawPointer(base), width: CVPixelBufferGetWidth(depth),
+                                   height: CVPixelBufferGetHeight(depth),
+                                   rowBytes: CVPixelBufferGetBytesPerRow(depth), imageSize: size)
+        let d: [Float] = pts.compactMap { sampler.depth(at: $0) }.sorted()
+        return d.isEmpty ? nil : d[d.count / 2]
+    }
+
     private func reset() {
         filters.forEach { $0.reset() }
+        lastHandDepth = nil
         leftVotes = 0
         disagreeing = 0
         lastCentroid = nil

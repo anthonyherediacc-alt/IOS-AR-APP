@@ -87,6 +87,13 @@ bend, motion blur, noise; Vision-like joint errors): mean wound error 45° tilt 
 deformable 1.8; 60° tilt: joints 3.4, deformable 2.1. LK accuracy on the true skin points ≈ 0.1 px; skin tracking drifts a
 little during strong tilts and is pulled back by the joints over ~1–2 s.
 History: v1 2D 1€ + thin-plate spline; v3 3D rigid frame from LiDAR joint depths (removed, device test 3); v4 skin-locked affine.
+Review fixes (v5, adversarial review with independent verification): other hand no longer steals the wound when it covers
+the wound hand (opposite-label hand rejected on an established track unless it matches the skin grid; identity kept 5 s
+while covered); the wound hand is never its own occluder; no ghost wound on the background after the hand leaves (depth
+rejects off-skin nodes, confidence can't rise without Vision); confidence never drops when more skin is tracked; skin-only
+frames carry the joints' map along (no double motion); hand depth for occlusion ignores covered nodes; collinear affine
+fits refused; reference luma reseeded on acquire; renderer skips identical frames and reuses buffers; per-node LK runs
+on all cores; debug view shows processing ms / fps.
 Build: XcodeGen `ios/project.yml` + `.github/workflows/ios.yml` on `macos-15` → unsigned `WoundAR.ipa`
 artifact → sideload from Windows with Sideloadly (free Apple ID = 7-day signing). See `ios/README.md`.
 Device test 1 (iPhone, iOS 27): app runs, wound lands on the back of the hand and follows it; chirality/dorsal rule correct.

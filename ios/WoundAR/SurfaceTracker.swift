@@ -142,16 +142,22 @@ final class SurfaceTracker {
             return false
         }
 
-        // 1) Each node follows the skin.
+        // 1) Each node follows the skin (independent per node, so tracked on all cores; results are identical).
         let n = q.count
+        var flow = [SIMD2<Float>?](repeating: nil, count: n)
+        flow.withUnsafeMutableBufferPointer { buffer in
+            let out = buffer
+            DispatchQueue.concurrentPerform(iterations: n) { i in
+                let p = current[i] / 2 // pyramid level 0 is half resolution
+                guard let moved = SkinFlow.track(p, from: before, to: now),
+                      let back = SkinFlow.track(moved, from: now, to: before),
+                      simd_distance(back, p) < 1 else { return }
+                out[i] = moved * 2
+            }
+        }
         var observed = current, w = [Float](repeating: 0, count: n)
         for i in 0..<n {
-            let p = current[i] / 2 // pyramid level 0 is half resolution
-            guard let moved = SkinFlow.track(p, from: before, to: now),
-                  let back = SkinFlow.track(moved, from: now, to: before),
-                  simd_distance(back, p) < 1 else { continue }
-            let o = moved * 2
-            if isOffSkin(o) { continue }
+            guard let o = flow[i], !isOffSkin(o) else { continue }
             observed[i] = o
             w[i] = 1
         }
@@ -175,11 +181,15 @@ final class SurfaceTracker {
 
         if !options.deformable {
             // Rigid patch (the previous build): one affine for the whole wound, pulled toward the joints.
-            guard var rigid = Affine2D.fit(inliers.map { q[$0] }, inliers.map { observed[$0] }) else {
+            let fitSet = inliers.count >= SurfaceTracker.minTracked ? inliers : valid
+            guard var rigid = Affine2D.fit(fitSet.map { q[$0] }, fitSet.map { observed[$0] }) else {
                 carryWithJoints(current, anchor: anchor, anchored: anchored, frames: frames)
                 return false
             }
             if let anchor { rigid = rigid.blended(toward: anchor, by: Float(SurfaceTracker.anchorWeight) * frames) }
+            // Skin-only frame: carry the joints' last map along with the skin, so a later joints-carry doesn't add
+            // this motion a second time.
+            if anchor == nil, let previous = lastAnchor { lastAnchor = previous.followed(by: motion) }
             nodes = q.map { rigid.apply($0) }
             weights = w
             flowConfidence = Float(inliers.count) / Float(n)
@@ -222,6 +232,7 @@ final class SurfaceTracker {
                 trust[i] = w[i] / (1 + r * r)
             }
         }
+        if anchor == nil, let previous = lastAnchor { lastAnchor = previous.followed(by: motion) }
         nodes = solved
         weights = trust
         flowConfidence = trust.reduce(0, +) / Float(n)

@@ -64,6 +64,13 @@ struct Affine2D {
         Affine2D(x: x + a * (other.x - x), y: y + a * (other.y - y))
     }
 
+    // q ↦ m.apply(apply(q))
+    func followed(by m: Affine2D) -> Affine2D {
+        let nx: SIMD3<Float> = x * m.x.x + y * m.x.y + SIMD3<Float>(0, 0, m.x.z)
+        let ny: SIMD3<Float> = x * m.y.x + y * m.y.y + SIMD3<Float>(0, 0, m.y.z)
+        return Affine2D(x: nx, y: ny)
+    }
+
     func inverted() -> Affine2D? {
         let det = x.x * y.y - x.y * y.x
         guard abs(det) > 1e-9 else { return nil }
@@ -71,7 +78,8 @@ struct Affine2D {
         return Affine2D(x: SIMD3(ia, ib, -(ia * x.z + ib * y.z)), y: SIMD3(ic, id, -(ic * x.z + id * y.z)))
     }
 
-    // Least squares through point pairs (needs ≥ 3 non-collinear points).
+    // Least squares through point pairs. nil when the source points are (nearly) collinear: the map across their
+    // line is then undetermined (e.g. only one column of the skin grid tracked) and a solve would return garbage.
     static func fit(_ src: [SIMD2<Float>], _ dst: [SIMD2<Float>]) -> Affine2D? {
         guard src.count >= 3, src.count == dst.count else { return nil }
         var ata = [[Double]](repeating: [Double](repeating: 0, count: 3), count: 3)
@@ -84,6 +92,15 @@ struct Affine2D {
                 for j in 0..<3 { ata[i][j] += h[i] * h[j] }
             }
         }
+        // Spread of the source points: covariance det / trace² must exceed 1e-4 (minor axis std > 1 % of major).
+        let count: Double = ata[2][2]
+        let mx: Double = ata[0][2] / count
+        let my: Double = ata[1][2] / count
+        let sxx: Double = ata[0][0] / count - mx * mx
+        let syy: Double = ata[1][1] / count - my * my
+        let sxy: Double = ata[0][1] / count - mx * my
+        let spread: Double = sxx + syy
+        guard spread > 0, sxx * syy - sxy * sxy > 1e-4 * spread * spread else { return nil }
         guard let cx = solveLinearSystem(ata, bx), let cy = solveLinearSystem(ata, by) else { return nil }
         return Affine2D(x: SIMD3(Float(cx[0]), Float(cx[1]), Float(cx[2])),
                         y: SIMD3(Float(cy[0]), Float(cy[1]), Float(cy[2])))
@@ -301,6 +318,7 @@ struct LumaPlane {
     let height: Int
     let rowBytes: Int
     let wide: Bool
+    let videoRange: Bool
 
     init?(locked image: CVPixelBuffer) {
         guard CVPixelBufferGetPlaneCount(image) >= 1, let b = CVPixelBufferGetBaseAddressOfPlane(image, 0) else { return nil }
@@ -310,6 +328,8 @@ struct LumaPlane {
         height = CVPixelBufferGetHeightOfPlane(image, 0)
         rowBytes = CVPixelBufferGetBytesPerRowOfPlane(image, 0)
         wide = format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+            || format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        videoRange = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
             || format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
     }
 
@@ -332,7 +352,10 @@ func meanLuma(_ image: CVPixelBuffer, at pixels: [SIMD2<Float>]) -> Float? {
         sum += luma.at(x, y)
         n += 1
     }
-    return n > 0 ? Float(sum) / Float(n) / 255 : nil
+    guard n > 0 else { return nil }
+    let mean = Float(sum) / Float(n) / 255
+    // Video range (16…235) → full range, as the shader does for the camera picture.
+    return luma.videoRange ? min(max((mean - Float(16.0 / 255.0)) * Float(255.0 / 219.0), 0), 1) : mean
 }
 
 // Reads the LiDAR depth map (metres, Float32) at a point of the captured camera image.

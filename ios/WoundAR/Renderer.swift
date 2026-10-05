@@ -23,6 +23,7 @@ private struct WoundUniforms {
 
 // Everything one displayed frame needs: the camera image the wound was computed from, and the wound in that image.
 struct RenderFrame {
+    let id: Int
     let image: CVPixelBuffer
     let vertices: [WoundVertex]
     let indices: [UInt16]
@@ -41,6 +42,10 @@ final class Renderer: NSObject, MTKViewDelegate {
     private let woundPipeline: MTLRenderPipelineState
     private let woundTexture: MTLTexture
     private var textureCache: CVMetalTextureCache?
+    private var drawnFrameID = -1 // frame sync: the RenderFrame already on screen (the layer keeps showing it)
+    private var meshFrameID = -1 // the RenderFrame whose mesh is in vertexBuffer / indexBuffer
+    private var vertexBuffer: MTLBuffer?
+    private var indexBuffer: MTLBuffer?
 
     // Supplied by the session (main thread).
     var currentFrame: () -> RenderFrame? = { nil }
@@ -76,10 +81,11 @@ final class Renderer: NSObject, MTKViewDelegate {
         view.delegate = self
     }
 
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) { drawnFrameID = -1 }
 
     func draw(in view: MTKView) {
         let frame = currentFrame()
+        if frameSync, let frame, frame.id == drawnFrameID { return } // same picture as on screen: nothing to do
         guard let image = frameSync ? (frame?.image ?? liveImage()) : (liveImage() ?? frame?.image),
               let transform = displayTransform(view.bounds.size),
               let planes = cameraTextures(image),
@@ -104,35 +110,41 @@ final class Renderer: NSObject, MTKViewDelegate {
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
 
         // Wound, composited with the skin under it in the same image.
-        if let frame, frame.opacity > 0.001, !frame.indices.isEmpty,
-           let vertexBuffer = device.makeBuffer(bytes: frame.vertices,
-                                                length: MemoryLayout<WoundVertex>.stride * frame.vertices.count),
-           let indexBuffer = device.makeBuffer(bytes: frame.indices,
-                                               length: MemoryLayout<UInt16>.stride * frame.indices.count) {
-            let size = SIMD2<Float>(Float(CVPixelBufferGetWidth(image)), Float(CVPixelBufferGetHeight(image)))
-            var uniforms = WoundUniforms(
-                display: SIMD4(Float(transform.a), Float(transform.b), Float(transform.c), Float(transform.d)),
-                displayT: SIMD4(Float(transform.tx), Float(transform.ty), 0, 0),
-                params: SIMD4(frame.opacity, frame.referenceLuma, blendSkin ? 1 : 0, Float(frame.capsules.count)),
-                texel: SIMD4(1 / size.x, 1 / size.y, debugTint ? 1 : 0, videoRange))
-            var capsules = frame.capsules.isEmpty ? [Capsule(ends: .zero, params: .zero)] : frame.capsules
-            encoder.setRenderPipelineState(woundPipeline)
-            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-            encoder.setVertexBytes(&uniforms, length: MemoryLayout<WoundUniforms>.stride, index: 1)
-            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<WoundUniforms>.stride, index: 0)
-            encoder.setFragmentBytes(&capsules, length: MemoryLayout<Capsule>.stride * capsules.count, index: 1)
-            encoder.setFragmentTexture(planes.y, index: 0)
-            encoder.setFragmentTexture(planes.cbcr, index: 1)
-            encoder.setFragmentTexture(woundTexture, index: 2)
-            encoder.drawIndexedPrimitives(type: .triangle, indexCount: frame.indices.count, indexType: .uint16,
-                                          indexBuffer: indexBuffer, indexBufferOffset: 0)
+        if let frame, frame.opacity > 0.001, !frame.indices.isEmpty {
+            if frame.id != meshFrameID {
+                vertexBuffer = device.makeBuffer(bytes: frame.vertices,
+                                                 length: MemoryLayout<WoundVertex>.stride * frame.vertices.count)
+                indexBuffer = device.makeBuffer(bytes: frame.indices,
+                                                length: MemoryLayout<UInt16>.stride * frame.indices.count)
+                meshFrameID = frame.id
+            }
+            if let vertexBuffer, let indexBuffer {
+                let size = SIMD2<Float>(Float(CVPixelBufferGetWidth(image)), Float(CVPixelBufferGetHeight(image)))
+                var uniforms = WoundUniforms(
+                    display: SIMD4(Float(transform.a), Float(transform.b), Float(transform.c), Float(transform.d)),
+                    displayT: SIMD4(Float(transform.tx), Float(transform.ty), 0, 0),
+                    params: SIMD4(frame.opacity, frame.referenceLuma, blendSkin ? 1 : 0, Float(frame.capsules.count)),
+                    texel: SIMD4(1 / size.x, 1 / size.y, debugTint ? 1 : 0, videoRange))
+                var capsules = frame.capsules.isEmpty ? [Capsule(ends: .zero, params: .zero)] : frame.capsules
+                encoder.setRenderPipelineState(woundPipeline)
+                encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<WoundUniforms>.stride, index: 1)
+                encoder.setFragmentBytes(&uniforms, length: MemoryLayout<WoundUniforms>.stride, index: 0)
+                encoder.setFragmentBytes(&capsules, length: MemoryLayout<Capsule>.stride * capsules.count, index: 1)
+                encoder.setFragmentTexture(planes.y, index: 0)
+                encoder.setFragmentTexture(planes.cbcr, index: 1)
+                encoder.setFragmentTexture(woundTexture, index: 2)
+                encoder.drawIndexedPrimitives(type: .triangle, indexCount: frame.indices.count, indexType: .uint16,
+                                              indexBuffer: indexBuffer, indexBufferOffset: 0)
+            }
         }
         encoder.endEncoding()
         // Keep the camera textures alive until the GPU is done with them.
         let retained = planes
-        commands.addCompletedHandler { _ in _ = retained }
+        commands.addCompletedHandler { _ in withExtendedLifetime(retained) {} }
         commands.present(drawable)
         commands.commit()
+        drawnFrameID = frameSync ? (frame?.id ?? -1) : -1
     }
 
     var blendSkin = true
