@@ -61,13 +61,32 @@ Frame-synced compositing, ported MediaPipe Procrustes pose, landmark 1€ smooth
 
 ## Native iPhone app (ios/) — LiDAR
 Safari on iPhone has no WebXR AR and no LiDAR access (2026), so depth needs a native app.
-SwiftUI + ARKit (`smoothedSceneDepth`, `personSegmentationWithDepth`) + RealityKit + Vision hand pose. (`personSegmentationWithDepth` removed — see device test.)
-Pipeline (current): Vision 21 joints → 1€ (Swift port) on wrist/MCP image points → least-squares affine map hand template →
-image → carried frame to frame by a skin tracker (pyramidal Lucas–Kanade on a 6×7 grid of back-of-hand points, forward–backward
-checked, robust affine refit) and pulled toward the joints' map by 2 %/frame (50 % if they disagree by > 0.35 hand widths) →
-wound grid image positions → LiDAR skin surface under the wound → unproject → world mesh (UnlitMaterial, texture alpha).
-Back/palm: same 2D cross + chirality rule (chirality = majority of Vision's labels over the track), normalized, with hysteresis.
-History: v1 2D 1€ + thin-plate spline; v3 3D rigid frame from LiDAR joint depths (removed, see device test 3).
+SwiftUI + ARKit (ARSession, `smoothedSceneDepth`) + Vision hand pose + Metal (own renderer; RealityKit removed in v5).
+Pipeline (v5, current): Vision joints → pick wound hand (nearest to last, label tiebreak) → back/palm (2D cross + majority
+chirality, hysteresis) → 1€ joints → affine "anchor" (template → image) → `SurfaceTracker`: 5×9 control grid over the skin
+under the wound; each node tracked on the skin (own pyramidal LK, forward–backward), then regularized least squares
+(Σwᵢ‖pᵢ−oᵢ‖² + λs‖L(p)−L(p̂)‖² + λa‖p−a‖², IRLS; Pilet/Lepetit/Fua 2008 deformable-surface augmentation; λs 2, λa 0.02 per
+1/30 s) → Catmull–Rom render mesh (12×30) in camera-image space → confidence/opacity → occluders → `RenderFrame` (this camera
+frame + mesh) → `Renderer` (Metal, Apple ARKit-Metal-template camera pass) draws background and wound from the SAME frame.
+Confidence: opacity = ramp(skin-tracked share) × ramp(foreshortening minor/major 0.12–0.28); Vision dropouts bridged by skin
+tracking; skin loss → grid moves with the joints and glides to them (25 %/30 fps frame); skin/joints > 0.35 hand widths apart
+for 3 frames → fade out, re-acquire, fade in (never a jump). Occlusion: other hand = soft capsules (bones + palm) unless LiDAR
+says it is ≥3 cm behind; LiDAR per vertex: background ≥5–8 cm behind the hand's median depth = hand ended, ≥1.5–3 cm in front of
+the fitted skin = covered; locally folded triangles dropped. LiDAR never sets the wound's position or shape.
+Shader: picture border forced transparent; deep cut (alpha > 0.75–0.95) takes the skin's local shading (blurred skin luma ÷
+reference luma; ratio transfer as in Bradley & Roth 2004); halo multiplies the skin by the wound hue (pores, hair, lighting stay).
+Settings panel (slider icon) toggles each stage; debug view shows raw/smoothed joints, raw/filtered/final outlines, nodes
+(green tracked / orange weak / grey lost), surface axes, normal lean, capsules, confidence text.
+"Floating sticker" analysis (v4, before v5): (1) the wound was computed from an older camera frame than the one on screen
+(Vision tens of ms) → trails the hand (fixed by frame sync); (2) driven by joint estimates that wander on the skin (skin lock);
+(3) one rigid transform — no bending/perspective beyond affine (deformable grid); (4) 3D placement from close-range LiDAR →
+swimming when the phone moves (image-space rendering); (5) flat picture: hard edge, flat halo, no skin shading (shader);
+(6) no confidence: pops/jumps instead of fading (opacity model).
+Synthetic "makeup" test (user's real skin texture; perspective tilt about the hand, in-plane rotation, translation, non-rigid
+bend, motion blur, noise; Vision-like joint errors): mean wound error 45° tilt + bend: joints 3.2 mm, rigid skin patch 1.9,
+deformable 1.8; 60° tilt: joints 3.4, deformable 2.1. LK accuracy on the true skin points ≈ 0.1 px; skin tracking drifts a
+little during strong tilts and is pulled back by the joints over ~1–2 s.
+History: v1 2D 1€ + thin-plate spline; v3 3D rigid frame from LiDAR joint depths (removed, device test 3); v4 skin-locked affine.
 Build: XcodeGen `ios/project.yml` + `.github/workflows/ios.yml` on `macos-15` → unsigned `WoundAR.ipa`
 artifact → sideload from Windows with Sideloadly (free Apple ID = 7-day signing). See `ios/README.md`.
 Device test 1 (iPhone, iOS 27): app runs, wound lands on the back of the hand and follows it; chirality/dorsal rule correct.
@@ -105,8 +124,9 @@ texture instead (own pyramidal LK, Bouguet 2000 — validated against OpenCV cal
 iPad question (researched, verified): no improvement expected — ARKit sceneDepth is 256×192 @ 60 Hz on every LiDAR device
 (Apple WWDC20/22, ARKitScenes recorded on iPad Pro), the 2020 iPad Pro and iPhone 12 Pro share the LiDAR part, Vision hand pose
 is the same model; iPad is heavier, has no rear ultra-wide (used by world tracking) and the app is iPhone-only (device family 1).
-Still open: wound is computed from the frame Vision just finished (≈1 frame behind the live camera when the hand moves);
-no motion blur; brightness is one value for the whole wound (no shading gradient across it).
+Still open (v5): display is ~1 processing interval behind live (the price of frame sync); no motion blur on the wound; the
+wound hand's own fingers don't occlude it (only LiDAR); grid can drift slightly during strong tilts (joint pull corrects it).
 
 ## Next task
-Native app device test 3 (smooth surface, edge clipping, brightness match). Web: panel settings/picture are not saved across reloads.
+Native app device test 4 (v5): cases A (phone moves, hand still), B (hand translates), C (hand rotates/bends), each with the
+toggles and the debug view. Web: panel settings/picture are not saved across reloads.

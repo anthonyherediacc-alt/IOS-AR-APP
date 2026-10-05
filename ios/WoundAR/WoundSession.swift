@@ -485,7 +485,8 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
             let compressed = simd_length(u) < simd_length(v) ? u : v
             let tilt = acos(min(max(foreshortening, 0), 1))
             if simd_length(compressed) > 1e-3 {
-                info.normal = simd_normalize(compressed) * sin(tilt) * 0.3 * handSize
+                let length: Float = sin(tilt) * 0.3 * handSize
+                info.normal = simd_normalize(compressed) * length
             }
         }
         let mode = tracker.nodes == nil ? "lost" : (tracker.followingSkin ? "skin" : "joints")

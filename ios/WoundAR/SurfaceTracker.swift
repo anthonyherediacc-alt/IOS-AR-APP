@@ -45,11 +45,17 @@ final class SurfaceTracker {
     private(set) var followingSkin = false // false: carried by the joints this frame (skin not trackable)
     private var lastAnchor: Affine2D?
 
-    private static let gridST: [SIMD2<Float>] = (0..<ny).flatMap { j in
-        (0..<nx).map { i in
-            SIMD2(spanS * (Float(i) / Float(nx - 1) - 0.5), spanT * (Float(j) / Float(ny - 1) - 0.5))
+    private static let gridST: [SIMD2<Float>] = {
+        var grid: [SIMD2<Float>] = []
+        for j in 0..<ny {
+            let t: Float = spanT * (Float(j) / Float(ny - 1) - 0.5)
+            for i in 0..<nx {
+                let s: Float = spanS * (Float(i) / Float(nx - 1) - 0.5)
+                grid.append(SIMD2<Float>(s, t))
+            }
         }
-    }
+        return grid
+    }()
 
     // LᵀL of the umbrella Laplacian (node minus the mean of its 4-neighbours).
     private static let laplacianSquared: [[Double]] = {
@@ -58,7 +64,10 @@ final class SurfaceTracker {
         for j in 0..<ny {
             for i in 0..<nx {
                 let k = j * nx + i
-                let neighbours = [(i - 1, j), (i + 1, j), (i, j - 1), (i, j + 1)].filter { $0.0 >= 0 && $0.0 < nx && $0.1 >= 0 && $0.1 < ny }
+                var neighbours: [(Int, Int)] = []
+                for (a, b) in [(i - 1, j), (i + 1, j), (i, j - 1), (i, j + 1)] where a >= 0 && a < nx && b >= 0 && b < ny {
+                    neighbours.append((a, b))
+                }
                 l[k][k] = 1
                 for (a, b) in neighbours { l[k][b * nx + a] -= 1 / Double(neighbours.count) }
             }
@@ -230,10 +239,15 @@ final class SurfaceTracker {
             g[min(max(j, 0), ny - 1) * nx + min(max(i, 0), nx - 1)]
         }
         func spline(_ p0: SIMD2<Float>, _ p1: SIMD2<Float>, _ p2: SIMD2<Float>, _ p3: SIMD2<Float>, _ x: Float) -> SIMD2<Float> {
-            let c1 = p2 - p0
-            let c2 = 2 * p0 - 5 * p1 + 4 * p2 - p3
-            let c3 = 3 * (p1 - p2) + p3 - p0
-            return p1 + 0.5 * x * (c1 + x * (c2 + x * c3))
+            // Standard Catmull–Rom: p1 + ½x[(p2 − p0) + x((2p0 − 5p1 + 4p2 − p3) + x(3(p1 − p2) + p3 − p0))]
+            let c1: SIMD2<Float> = p2 - p0
+            let twoP0: SIMD2<Float> = p0 * 2, fiveP1: SIMD2<Float> = p1 * 5, fourP2: SIMD2<Float> = p2 * 4
+            let c2: SIMD2<Float> = twoP0 - fiveP1 + fourP2 - p3
+            let threeD: SIMD2<Float> = (p1 - p2) * 3
+            let c3: SIMD2<Float> = threeD + p3 - p0
+            let inner: SIMD2<Float> = c2 + c3 * x
+            let middle: SIMD2<Float> = c1 + inner * x
+            return p1 + middle * (0.5 * x)
         }
         var rows: [SIMD2<Float>] = []
         for d in -1...2 {
