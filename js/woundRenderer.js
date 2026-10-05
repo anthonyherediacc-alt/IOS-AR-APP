@@ -9,19 +9,19 @@ export function loadWoundImage(wound) {
   return img;
 }
 
-// t = smoothed transform in canvas pixels ({x, y, scale, rotation}).
-export function drawWound(ctx, wound, t) {
+// pose = hand frame from getHandFrame (affine a..f maps hand-local units to canvas px, plus indexSide).
+// Canvas 2D only does affine transforms, which is exactly weak-perspective projection of a plane,
+// so tilting the hand foreshortens the wound naturally.
+export function drawWound(ctx, wound, pose, alpha) {
   const img = loadWoundImage(wound);
-  if (!img.complete || !img.naturalWidth) return;
-  const w = t.scale * wound.scale;
+  if (!img.complete || !img.naturalWidth || alpha <= 0) return;
+  const w = wound.scale;
   const h = w * (img.naturalHeight / img.naturalWidth);
   ctx.save();
-  ctx.globalAlpha = wound.opacity;
-  ctx.translate(t.x, t.y);
-  ctx.rotate(t.rotation);
-  // Offsets are applied after rotation, so they're in hand space (palm lengths);
-  // -yOffset because canvas y is down and +y should mean "toward fingers".
-  ctx.translate(wound.xOffset * t.scale, -wound.yOffset * t.scale);
+  ctx.globalAlpha = wound.opacity * alpha;
+  ctx.setTransform(pose.a, pose.b, pose.c, pose.d, pose.e, pose.f);
+  ctx.translate(wound.xOffset * pose.indexSide, wound.yOffset);
+  ctx.scale(1, -1); // image y points down; local +v points toward the fingers
   ctx.rotate((wound.rotationOffset * Math.PI) / 180);
   ctx.drawImage(img, -w / 2, -h / 2, w, h);
   ctx.restore();
