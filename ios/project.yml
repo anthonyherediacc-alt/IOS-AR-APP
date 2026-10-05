@@ -1,0 +1,18 @@
+# XcodeGen spec (https://github.com/yonaskolb/XcodeGen). The .xcodeproj is generated in CI; not committed.
+name: WoundAR
+options:
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  WoundAR:
+    type: application
+    platform: iOS
+    sources: [WoundAR]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.woundsim.WoundAR
+        INFOPLIST_FILE: WoundAR/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        CODE_SIGNING_ALLOWED: "NO"
