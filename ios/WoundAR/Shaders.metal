@@ -124,7 +124,7 @@ fragment float4 woundFragment(WoundOut in [[stage_in]],
     float visible = saturate(in.visibility) * (1.0 - cover) * border * u.params.x;
     float3 result;
     if (u.params.z > 0.5) {
-        // Skin-aware compositing (shading/"ratio" transfer as in Bradley & Roth 2004 / Pilet et al. 2008):
+        // Skin-aware compositing (shading/"ratio" transfer as in Bradley, Roth & Bose 2009 / Pilet et al. 2008):
         // the skin's own low-frequency shading under the wound modulates it, so it darkens where the hand does.
         float2 t = u.texel.xy * 7.0;
         float3 blur = (cameraRGB(texY, texCbCr, s, in.image + float2(t.x, 0), videoRange)

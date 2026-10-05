@@ -74,7 +74,7 @@ for 3 frames → fade out, re-acquire, fade in (never a jump). Occlusion: other 
 says it is ≥3 cm behind; LiDAR per vertex: background ≥5–8 cm behind the hand's median depth = hand ended, ≥1.5–3 cm in front of
 the fitted skin = covered; locally folded triangles dropped. LiDAR never sets the wound's position or shape.
 Shader: picture border forced transparent; deep cut (alpha > 0.75–0.95) takes the skin's local shading (blurred skin luma ÷
-reference luma; ratio transfer as in Bradley & Roth 2004); halo multiplies the skin by the wound hue (pores, hair, lighting stay).
+reference luma; ratio transfer as in Bradley, Roth & Bose 2009); halo multiplies the skin by the wound hue (pores, hair, lighting stay).
 Settings panel (slider icon) toggles each stage; debug view shows raw/smoothed joints, raw/filtered/final outlines, nodes
 (green tracked / orange weak / grey lost), surface axes, normal lean, capsules, confidence text.
 "Floating sticker" analysis (v4, before v5): (1) the wound was computed from an older camera frame than the one on screen
