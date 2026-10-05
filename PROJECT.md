@@ -10,6 +10,7 @@ Wounds are placed in hand-local units (hand widths) on the back of the hand; not
 - `js/vendor/` — `OneEuroFilter.js`, `svd.js` (unmodified third-party files).
 - `js/woundRenderer.js` — Three.js scene (camera background + lit wound plane), `woundCorners` (debug).
 - `js/app.js` — camera, frame-synced loop, status/errors, debug overlay (raw vs filtered pose).
+- `js/controls.js` — side panel: sideways/up-down/size sliders (edit the active wound live), user picture (object URL → temporary wound entry), reset to config defaults.
 - `index.html`, `style.css`, `assets/wounds/*.png` (generated placeholders).
 
 ## Dependencies
@@ -42,7 +43,7 @@ Rejected: js-aruco `svd.js` (port of Numerical Recipes `svdcmp`; NR license is r
 - Feature-detected: secure context, `mediaDevices.getUserMedia`, WebAssembly.
 
 ## Working (headless Chromium: sample photos + synthetic motion sequences)
-Frame-synced compositing, ported MediaPipe Procrustes pose, landmark 1€ smoothing, Three.js lit wound plane with height-map relief, surface lift, dorsal-only visibility with hysteresis, debug (patch, template fit, raw vs filtered axes/normal/quad, facing, speed, inference ms), error messages.
+Frame-synced compositing, ported MediaPipe Procrustes pose, landmark 1€ smoothing, Three.js lit wound plane with height-map relief, surface lift, Adjust panel (offsets, size, own picture, reset), dorsal-only visibility with hysteresis, debug (patch, template fit, raw vs filtered axes/normal/quad, facing, speed, inference ms), error messages.
 
 ## Bugs / unverified
 - Not yet tested on a real iPhone (frame-capture cost, GPU delegate, filter tuning, real jitter).
@@ -53,4 +54,4 @@ Frame-synced compositing, ported MediaPipe Procrustes pose, landmark 1€ smooth
 - Rigid pose relies on MediaPipe z for yaw/pitch; synthetic yaw shows up to 13 % width error (unverified on a real hand).
 
 ## Next task
-Real-iPhone test of surface lock; then occlusion (if needed) and control panel.
+Real-iPhone test of surface lock + Adjust panel; then occlusion (if needed). Panel settings/picture are not saved across reloads.

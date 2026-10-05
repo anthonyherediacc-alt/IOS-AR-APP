@@ -4,6 +4,7 @@ import {
   getFacingLabel, TEMPLATE,
 } from "./handTracker.js";
 import { createRenderer, loadWoundImage, woundCorners } from "./woundRenderer.js";
+import { initControls } from "./controls.js";
 
 const $ = (id) => document.getElementById(id);
 const video = $("video"), view = $("view"), canvas = $("overlay"), ctx = canvas.getContext("2d");
@@ -234,3 +235,4 @@ debugToggle.addEventListener("change", () => {
 });
 debugEl.hidden = !SETTINGS.debug;
 WOUNDS.forEach(loadWoundImage); // preload
+initControls(currentWound, (msg) => alert(msg)); // alert: status text is overwritten each frame

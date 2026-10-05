@@ -9,3 +9,12 @@ html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 15px 
 #start[hidden] { display: none; }
 #hud { position: fixed; left: 8px; top: calc(8px + env(safe-area-inset-top)); padding: 6px 10px; background: rgba(0,0,0,.5); border-radius: 6px; display: flex; gap: 10px; align-items: center; }
 #debugInfo { font: 12px ui-monospace, monospace; }
+#panelToggle { position: fixed; right: 8px; top: calc(8px + env(safe-area-inset-top)); padding: 8px 14px; border: 0; border-radius: 6px; background: rgba(0,0,0,.6); color: #fff; font-size: 15px; }
+#panel { position: fixed; right: 8px; top: calc(52px + env(safe-area-inset-top)); width: min(220px, calc(100vw - 32px)); max-height: calc(100% - 120px); overflow-y: auto; padding: 12px; background: rgba(0,0,0,.65); border-radius: 8px; display: flex; flex-direction: column; gap: 12px; }
+#panel[hidden] { display: none; }
+#panel label { display: flex; flex-direction: column; gap: 4px; }
+#panel small { opacity: .7; font-size: 12px; }
+#panel input[type=range] { width: 100%; }
+#panel .button { position: relative; padding: 10px; border: 0; border-radius: 6px; background: #444; color: #fff; font-size: 15px; text-align: center; }
+/* Visually hidden but still tappable via its label (iOS won't open a display:none file input). */
+#panel input[type=file] { position: absolute; inset: 0; opacity: 0; width: 100%; }
