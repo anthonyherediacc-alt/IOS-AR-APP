@@ -12,7 +12,11 @@ private enum Wound {
     static let rotationDegrees: Float = 20
     static let xOffset: Float = 0
     static let yOffset: Float = 0
-    static let liftMetres: Float = 0.003 // in front of the measured skin, so the hand's own occlusion depth doesn't hide it
+    // LiDAR occlusion: a wound point is hidden where the measured depth is this much closer than the skin
+    // should be there (e.g. the other hand's fingers); points this much farther are background past the
+    // hand's edge and use the fitted skin depth instead.
+    static let occluderMargin: Float = 0.012
+    static let backgroundMargin: Float = 0.04
 }
 
 private let segments = 16 // wound grid resolution per side
@@ -22,7 +26,9 @@ private let joints: [VNHumanHandPoseObservation.JointName] = [.wrist, .indexMCP,
 //   camera frame → Vision hand pose (21 joints, chirality) → 1€-smoothed wrist/MCP image points →
 //   thin-plate spline from the hand canonical layout to those points → every wound-grid vertex gets an
 //   image position → LiDAR depth at that pixel = the real skin surface → unproject to world space.
-// Other hands/fingers in front are hidden by ARKit people occlusion (personSegmentationWithDepth).
+// Occlusion also comes from the LiDAR depth: grid cells where something is in front of the skin are dropped.
+// (ARKit people occlusion was tried first: its ML depth for the wound hand itself kept landing in front of
+// the LiDAR skin surface, so the hand hid its own wound — visible flicker in the first device test.)
 final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
     @Published var status = "Point the camera at the back of your hand."
 
@@ -38,19 +44,6 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
     private var aspect: Float = 1
     private let filters = (0..<10).map { _ in OneEuroFilter(minCutoff: 0.1, beta: 10, dCutoff: 2) }
     private var lockedLeft: Bool?
-    private var visible = false
-    private let indices: [UInt32] = {
-        var idx: [UInt32] = []
-        let w = UInt32(segments + 1)
-        for y in 0..<UInt32(segments) {
-            for x in 0..<UInt32(segments) {
-                let a = y * w + x, b = a + 1, c = a + w, d = c + 1
-                idx += [a, c, b, b, c, d] // one winding…
-                idx += [a, b, c, b, d, c] // …and the other, so neither side is culled
-            }
-        }
-        return idx
-    }()
 
     func attach(to view: ARView) {
         let config = ARWorldTrackingConfiguration()
@@ -58,9 +51,6 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
             config.frameSemantics.insert(.smoothedSceneDepth)
         } else {
             status = "This iPhone has no LiDAR scanner (needs a Pro model)."
-        }
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.personSegmentationWithDepth) {
-            config.frameSemantics.insert(.personSegmentationWithDepth)
         }
         view.session.delegate = self
         view.scene.addAnchor(anchor)
@@ -112,6 +102,7 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
 
     private struct Result {
         var positions: [SIMD3<Float>]?
+        var indices: [UInt32] = []
         var status: String
     }
 
@@ -152,7 +143,6 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
         let cross = lateral.x * forward.y - lateral.y * forward.x
         let dorsal = side ? cross < 0 : cross > 0
         guard dorsal else {
-            visible = false
             return Result(positions: nil, status: "Palm facing the camera — turn your hand over.")
         }
 
@@ -168,15 +158,12 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
         let sampler = DepthSampler(base: UnsafeRawPointer(base), width: CVPixelBufferGetWidth(depth),
                                    height: CVPixelBufferGetHeight(depth), rowBytes: CVPixelBufferGetBytesPerRow(depth),
                                    imageSize: resolution)
-        // Reference depth of the back of the hand: median over the joints. Samples far from it (background
-        // seen past the hand's edge, or depth holes) fall back to it.
-        let jointDepths = pts.compactMap { sampler.depth(at: $0) }.sorted()
-        guard !jointDepths.isEmpty else { return Result(positions: nil, status: "Move a little closer.") }
-        let median = jointDepths[jointDepths.count / 2]
+        guard let expected = skinDepthPlane(pts, sampler) else { return Result(positions: nil, status: "Move a little closer.") }
 
         let fx = intrinsics[0][0], fy = intrinsics[1][1], cx = intrinsics[2][0], cy = intrinsics[2][1]
         let w = Wound.scale, h = w * aspect, t = Wound.rotationDegrees * .pi / 180
         var positions: [SIMD3<Float>] = []
+        var hidden: [Bool] = []
         positions.reserveCapacity((segments + 1) * (segments + 1))
         for iy in 0...segments {
             for ix in 0...segments {
@@ -185,9 +172,13 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
                 let rx = px * cos(t) - py * sin(t), ry = px * sin(t) + py * cos(t)
                 let local = SIMD2(Wound.xOffset * sgn + rx, Wound.yOffset - ry)
                 let pixel = tps.eval(local)
-                var d = sampler.depth(at: pixel) ?? median
-                if abs(d - median) > 0.05 { d = median }
-                d -= Wound.liftMetres
+                let skin = expected(pixel)
+                var d = skin, covered = false
+                if let measured = sampler.depth(at: pixel) {
+                    if measured < skin - Wound.occluderMargin { covered = true } // something in front of the skin
+                    else if measured < skin + Wound.backgroundMargin { d = measured } // the skin itself
+                }
+                hidden.append(covered)
                 // Unproject with the camera intrinsics. ARKit camera space: x right, y up, looking down −z,
                 // in the sensor's native (landscape) orientation, which is also capturedImage's.
                 let camPoint = SIMD4<Float>((pixel.x - cx) / fx * d, -(pixel.y - cy) / fy * d, -d, 1)
@@ -195,8 +186,40 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
                 positions.append(SIMD3(world.x, world.y, world.z))
             }
         }
-        return Result(positions: positions, status: "")
+        // Keep only grid cells with no covered corner; emit both windings so neither side is culled.
+        var indices: [UInt32] = []
+        let stride = segments + 1
+        for y in 0..<segments {
+            for x in 0..<segments {
+                let a = y * stride + x, b = a + 1, c = a + stride, e = c + 1
+                if hidden[a] || hidden[b] || hidden[c] || hidden[e] { continue }
+                let (ua, ub, uc, ue) = (UInt32(a), UInt32(b), UInt32(c), UInt32(e))
+                indices += [ua, uc, ub, ub, uc, ue, ua, ub, uc, ub, ue, uc]
+            }
+        }
+        return Result(positions: positions, indices: indices, status: "")
     }
+
+    // Expected skin depth across the back of the hand: least-squares plane d = a + b·x + c·y through the
+    // joints' LiDAR depths (pixel coordinates, centred for conditioning). Median if fewer than 3 joints.
+    private func skinDepthPlane(_ pts: [SIMD2<Float>], _ sampler: DepthSampler) -> ((SIMD2<Float>) -> Float)? {
+        var samples: [(SIMD2<Float>, Float)] = []
+        for p in pts { if let d = sampler.depth(at: p) { samples.append((p, d)) } }
+        guard !samples.isEmpty else { return nil }
+        let median = samples.map { $0.1 }.sorted()[samples.count / 2]
+        guard samples.count >= 3 else { return { _ in median } }
+        let centre = samples.reduce(SIMD2<Float>()) { $0 + $1.0 } / Float(samples.count)
+        var ata = simd_double3x3(), atb = SIMD3<Double>()
+        for (p, d) in samples {
+            let v = SIMD3<Double>(1, Double(p.x - centre.x), Double(p.y - centre.y))
+            ata += simd_double3x3(rows: [v * v.x, v * v.y, v * v.z])
+            atb += v * Double(d)
+        }
+        guard abs(ata.determinant) > 1e-6 else { return { _ in median } }
+        let c = ata.inverse * atb
+        return { p in Float(c.x + c.y * Double(p.x - centre.x) + c.z * Double(p.y - centre.y)) }
+    }
+
 
     private func pickHand(_ hands: [VNHumanHandPoseObservation]) -> VNHumanHandPoseObservation? {
         guard !hands.isEmpty else { return nil }
@@ -207,15 +230,14 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
     private func reset() {
         filters.forEach { $0.reset() }
         lockedLeft = nil
-        visible = false
     }
 
     // MARK: Rendering (main thread)
 
     private func apply(_ result: Result) {
-        status = result.status
+        if status != result.status { status = result.status }
         guard let entity = woundEntity else { return }
-        guard let positions = result.positions else {
+        guard let positions = result.positions, !result.indices.isEmpty else {
             entity.isEnabled = false
             return
         }
@@ -227,7 +249,7 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
         var descriptor = MeshDescriptor(name: "wound")
         descriptor.positions = MeshBuffers.Positions(positions)
         descriptor.textureCoordinates = MeshBuffers.TextureCoordinates(uvs)
-        descriptor.primitives = .triangles(indices)
+        descriptor.primitives = .triangles(result.indices)
         if let mesh = try? MeshResource.generate(from: [descriptor]) {
             entity.model?.mesh = mesh
             entity.isEnabled = true

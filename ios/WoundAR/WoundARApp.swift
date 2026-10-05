@@ -15,13 +15,15 @@ struct ContentView: View {
     var body: some View {
         ZStack(alignment: .top) {
             ARViewContainer(session: session).ignoresSafeArea()
-            Text(session.status)
-                .font(.footnote)
-                .foregroundColor(.white)
-                .padding(8)
-                .background(Color.black.opacity(0.55))
-                .cornerRadius(6)
-                .padding(.top, 8)
+            if !session.status.isEmpty {
+                Text(session.status)
+                    .font(.footnote)
+                    .foregroundColor(.white)
+                    .padding(8)
+                    .background(Color.black.opacity(0.55))
+                    .cornerRadius(6)
+                    .padding(.top, 8)
+            }
         }
     }
 }

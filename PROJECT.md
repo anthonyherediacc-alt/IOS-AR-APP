@@ -61,13 +61,16 @@ Frame-synced compositing, ported MediaPipe Procrustes pose, landmark 1€ smooth
 
 ## Native iPhone app (ios/) — LiDAR
 Safari on iPhone has no WebXR AR and no LiDAR access (2026), so depth needs a native app.
-SwiftUI + ARKit (`smoothedSceneDepth`, `personSegmentationWithDepth`) + RealityKit + Vision hand pose.
+SwiftUI + ARKit (`smoothedSceneDepth`, `personSegmentationWithDepth`) + RealityKit + Vision hand pose. (`personSegmentationWithDepth` removed — see device test.)
 Pipeline: Vision 21 joints → 1€ (Swift port) on wrist/MCP image points → thin-plate spline (Swift port)
 hand canonical layout → image → LiDAR depth per wound-grid vertex (real skin, 3 mm lift) → unproject with
 intrinsics → world mesh (UnlitMaterial, texture alpha). Back/palm: same 2D cross + chirality rule.
 Build: XcodeGen `ios/project.yml` + `.github/workflows/ios.yml` on `macos-15` → unsigned `WoundAR.ipa`
 artifact → sideload from Windows with Sideloadly (free Apple ID = 7-day signing). See `ios/README.md`.
-Unverified on device: Vision chirality convention, UV orientation, texture alpha, depth/occlusion interplay.
+Device test 1 (iPhone, iOS 27): app runs, wound lands on the back of the hand and follows it; chirality/dorsal rule correct.
+Bug found from screen recording: wound flickered/partly vanished with a still hand while status stayed empty → ARKit people
+occlusion's ML depth for the wound hand itself sat in front of the LiDAR skin. Fix: people occlusion off; occlusion from LiDAR
+instead (grid cells whose measured depth is >1.2 cm in front of a least-squares skin-depth plane through the joints are dropped).
 
 ## Next task
 Real-iPhone test of surface lock + Adjust panel; then occlusion (if needed). Panel settings/picture are not saved across reloads.
