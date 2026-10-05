@@ -1,7 +1,8 @@
 # Wound AR — native iPhone app (LiDAR)
 
-Same idea as the web app, but uses the iPhone's LiDAR depth so the wound sits on the measured skin, and
-ARKit people occlusion so the other hand (or anything closer to the camera) covers it.
+Same idea as the web app, but uses the iPhone's LiDAR depth so the wound sits on the measured skin, is
+covered by the other hand (or anything closer to the camera), is cut off where the hand ends, and is
+darkened/brightened to match the skin's brightness.
 Needs an iPhone **Pro** (12 Pro or newer, has LiDAR) and iOS 17+.
 
 ## Get the app (from Windows, no Mac needed)
@@ -15,9 +16,11 @@ Needs an iPhone **Pro** (12 Pro or newer, has LiDAR) and iOS 17+.
 
 ## How it works
 Vision hand pose (21 joints + left/right) → 1€-smoothed wrist/knuckle points → thin-plate spline from the
-hand canonical layout to those points → each wound-grid vertex gets an image position → LiDAR depth there
-(the real skin) → unprojected to world space with the camera intrinsics → RealityKit mesh.
+hand canonical layout to those points → each wound-grid vertex (24×24) gets an image position → one smooth
+curved skin surface fitted to the LiDAR depth there (least squares, outliers rejected) → unprojected to world
+space with the camera intrinsics → RealityKit mesh, clipped smoothly where the LiDAR sees something in front of
+the skin or background behind it, tinted by the camera brightness under the wound.
 Back vs palm uses the same 2D-cross-product + handedness rule as the web app.
 
 Code: `WoundAR/WoundSession.swift` (pipeline), `WoundAR/HandMath.swift` (ported 1€ filter and thin-plate
-spline, depth sampling), `project.yml` (XcodeGen; the Xcode project is generated in CI).
+spline, skin-surface fit, depth/brightness sampling), `project.yml` (XcodeGen; the Xcode project is generated in CI).

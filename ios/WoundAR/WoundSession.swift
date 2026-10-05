@@ -12,21 +12,28 @@ private enum Wound {
     static let rotationDegrees: Float = 20
     static let xOffset: Float = 0
     static let yOffset: Float = 0
-    // LiDAR occlusion: a wound point is hidden where the measured depth is this much closer than the skin
-    // should be there (e.g. the other hand's fingers); points this much farther are background past the
-    // hand's edge and use the fitted skin depth instead.
+    // LiDAR occlusion against the fitted skin surface: a wound point is hidden where the measured depth is
+    // this much closer (something in front, e.g. the other hand) or this much farther (background: the point
+    // is past the hand's outline, so there is no skin to draw on).
     static let occluderMargin: Float = 0.012
-    static let backgroundMargin: Float = 0.04
+    static let offHandMargin: Float = 0.02
+    // The visibility margin is clamped to ±this before the mesh is cut, so a cut edge between a clearly
+    // visible and a clearly hidden vertex lands halfway between them (a smooth outline, not grid steps).
+    static let edgeClamp: Float = 0.005
+    // Brightness matching: the wound is tinted by (skin luma under it ÷ this reference), clamped.
+    static let referenceLuma: Float = 0.55
+    static let tintRange: ClosedRange<Float> = 0.25...1
 }
 
-private let segments = 16 // wound grid resolution per side
+private let segments = 24 // wound grid resolution per side (also the resolution of occlusion edges)
 private let joints: [VNHumanHandPoseObservation.JointName] = [.wrist, .indexMCP, .middleMCP, .ringMCP, .littleMCP]
 
 // ARKit + Vision + LiDAR pipeline:
 //   camera frame → Vision hand pose (21 joints, chirality) → 1€-smoothed wrist/MCP image points →
 //   thin-plate spline from the hand canonical layout to those points → every wound-grid vertex gets an
-//   image position → LiDAR depth at that pixel = the real skin surface → unproject to world space.
-// Occlusion also comes from the LiDAR depth: grid cells where something is in front of the skin are dropped.
+//   image position → one smooth skin surface fitted robustly to the LiDAR depth under the wound → unproject
+//   to world space. Occlusion also comes from the LiDAR depth: grid cells where something is in front of the
+//   skin, or where the hand ends, are dropped. The wound is tinted to the skin's measured brightness.
 // (ARKit people occlusion was tried first: its ML depth for the wound hand itself kept landing in front of
 // the LiDAR skin surface, so the hand hid its own wound — visible flicker in the first device test.)
 final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
@@ -42,6 +49,9 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
     private let anchor = AnchorEntity(world: .zero)
     private var woundEntity: ModelEntity?
     private var aspect: Float = 1
+    private var material = UnlitMaterial()
+    private var tint: Float = 1 // smoothed brightness factor (vision queue)
+    private var appliedTint: Float = 1 // tint currently on the material (main)
     private let filters = (0..<10).map { _ in OneEuroFilter(minCutoff: 0.1, beta: 10, dCutoff: 2) }
     private var lockedLeft: Bool?
 
@@ -66,7 +76,6 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
             return
         }
         aspect = Float(cg.height) / Float(cg.width)
-        var material = UnlitMaterial()
         // A tint alpha just below 1 makes RealityKit honour the texture's alpha channel.
         material.color = .init(tint: UIColor.white.withAlphaComponent(0.999), texture: .init(texture))
         material.blending = .transparent(opacity: .init(floatLiteral: 1))
@@ -102,7 +111,9 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
 
     private struct Result {
         var positions: [SIMD3<Float>]?
+        var uvs: [SIMD2<Float>] = []
         var indices: [UInt32] = []
+        var tint: Float = 1
         var status: String
     }
 
@@ -158,68 +169,79 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
         let sampler = DepthSampler(base: UnsafeRawPointer(base), width: CVPixelBufferGetWidth(depth),
                                    height: CVPixelBufferGetHeight(depth), rowBytes: CVPixelBufferGetBytesPerRow(depth),
                                    imageSize: resolution)
-        guard let expected = skinDepthPlane(pts, sampler) else { return Result(positions: nil, status: "Move a little closer.") }
-
         let fx = intrinsics[0][0], fy = intrinsics[1][1], cx = intrinsics[2][0], cy = intrinsics[2][1]
         let w = Wound.scale, h = w * aspect, t = Wound.rotationDegrees * .pi / 180
-        var positions: [SIMD3<Float>] = []
-        var hidden: [Bool] = []
-        positions.reserveCapacity((segments + 1) * (segments + 1))
+        // 1) Image position of every wound-grid vertex (picture point → hand-local (u, v) → spline → pixel).
+        var pixels: [SIMD2<Float>] = []
+        pixels.reserveCapacity((segments + 1) * (segments + 1))
         for iy in 0...segments {
             for ix in 0...segments {
-                // Image point of the wound picture → hand-local (u, v) (same placement rules as the web app).
                 let px = (Float(ix) / Float(segments) - 0.5) * w, py = (Float(iy) / Float(segments) - 0.5) * h
                 let rx = px * cos(t) - py * sin(t), ry = px * sin(t) + py * cos(t)
-                let local = SIMD2(Wound.xOffset * sgn + rx, Wound.yOffset - ry)
-                let pixel = tps.eval(local)
-                let skin = expected(pixel)
-                var d = skin, covered = false
-                if let measured = sampler.depth(at: pixel) {
-                    if measured < skin - Wound.occluderMargin { covered = true } // something in front of the skin
-                    else if measured < skin + Wound.backgroundMargin { d = measured } // the skin itself
-                }
-                hidden.append(covered)
-                // Unproject with the camera intrinsics. ARKit camera space: x right, y up, looking down −z,
-                // in the sensor's native (landscape) orientation, which is also capturedImage's.
-                let camPoint = SIMD4<Float>((pixel.x - cx) / fx * d, -(pixel.y - cy) / fy * d, -d, 1)
-                let world = cameraTransform * camPoint
-                positions.append(SIMD3(world.x, world.y, world.z))
+                pixels.append(tps.eval(SIMD2(Wound.xOffset * sgn + rx, Wound.yOffset - ry)))
             }
         }
-        // Keep only grid cells with no covered corner; emit both windings so neither side is culled.
-        var indices: [UInt32] = []
+        // 2) LiDAR depth there; one smooth skin surface fitted to it, seeded by the depth at the joints.
+        let measured = pixels.map { sampler.depth(at: $0) }
+        let samples = zip(pixels, measured).compactMap { p, m in m.map { (p, $0) } }
+        let anchors = pts.compactMap { p in sampler.depth(at: p).map { (p, $0) } }
+        guard let skin = SkinSurface(samples: samples, anchors: anchors) else {
+            return Result(positions: nil, status: "Hold your hand 20–50 cm from the camera.")
+        }
+        // 3) Every vertex on that surface, plus a visibility margin: positive where the LiDAR sees this skin,
+        //    negative where something is in front (the other hand) or the hand has ended (background).
         let stride = segments + 1
+        var positions: [SIMD3<Float>] = [], uvs: [SIMD2<Float>] = [], margin: [Float] = []
+        var visiblePixels: [SIMD2<Float>] = []
+        positions.reserveCapacity(pixels.count * 2)
+        uvs.reserveCapacity(pixels.count * 2)
+        for (i, pixel) in pixels.enumerated() {
+            let d = skin.depth(at: pixel)
+            var f = Wound.edgeClamp
+            if let m = measured[i] { f = min(f, m - (d - Wound.occluderMargin), d + Wound.offHandMargin - m) }
+            f = max(f, -Wound.edgeClamp)
+            margin.append(f)
+            if f > 0 { visiblePixels.append(pixel) }
+            // Unproject with the camera intrinsics. ARKit camera space: x right, y up, looking down −z,
+            // in the sensor's native (landscape) orientation, which is also capturedImage's.
+            let camPoint = SIMD4<Float>((pixel.x - cx) / fx * d, -(pixel.y - cy) / fy * d, -d, 1)
+            let world = cameraTransform * camPoint
+            positions.append(SIMD3(world.x, world.y, world.z))
+            uvs.append(SIMD2(Float(i % stride) / Float(segments), 1 - Float(i / stride) / Float(segments)))
+        }
+        // 4) Match the wound's brightness to the skin it sits on (the camera image under the wound).
+        if let luma = meanLuma(image, at: visiblePixels) {
+            let target = min(max(luma / Wound.referenceLuma, Wound.tintRange.lowerBound), Wound.tintRange.upperBound)
+            tint += 0.3 * (target - tint)
+        }
+        // 5) Cut the mesh along the margin's zero line: each grid triangle is clipped against it
+        //    (Sutherland–Hodgman, one clip plane) with new edge vertices interpolated, so the wound's outline
+        //    follows the hand's edge and the other hand's fingers smoothly. Both windings: nothing is culled.
+        var indices: [UInt32] = []
         for y in 0..<segments {
             for x in 0..<segments {
                 let a = y * stride + x, b = a + 1, c = a + stride, e = c + 1
-                if hidden[a] || hidden[b] || hidden[c] || hidden[e] { continue }
-                let (ua, ub, uc, ue) = (UInt32(a), UInt32(b), UInt32(c), UInt32(e))
-                indices += [ua, uc, ub, ub, uc, ue, ua, ub, uc, ub, ue, uc]
+                for tri in [[a, c, b], [b, c, e]] {
+                    var poly: [UInt32] = []
+                    for k in 0..<3 {
+                        let p = tri[k], q = tri[(k + 1) % 3]
+                        if margin[p] >= 0 { poly.append(UInt32(p)) }
+                        if (margin[p] >= 0) != (margin[q] >= 0) {
+                            let s = margin[p] / (margin[p] - margin[q])
+                            positions.append(positions[p] + s * (positions[q] - positions[p]))
+                            uvs.append(uvs[p] + s * (uvs[q] - uvs[p]))
+                            poly.append(UInt32(positions.count - 1))
+                        }
+                    }
+                    guard poly.count >= 3 else { continue }
+                    for k in 1..<(poly.count - 1) {
+                        indices += [poly[0], poly[k], poly[k + 1], poly[0], poly[k + 1], poly[k]]
+                    }
+                }
             }
         }
-        return Result(positions: positions, indices: indices, status: "")
+        return Result(positions: positions, uvs: uvs, indices: indices, tint: tint, status: "")
     }
-
-    // Expected skin depth across the back of the hand: least-squares plane d = a + b·x + c·y through the
-    // joints' LiDAR depths (pixel coordinates, centred for conditioning). Median if fewer than 3 joints.
-    private func skinDepthPlane(_ pts: [SIMD2<Float>], _ sampler: DepthSampler) -> ((SIMD2<Float>) -> Float)? {
-        var samples: [(SIMD2<Float>, Float)] = []
-        for p in pts { if let d = sampler.depth(at: p) { samples.append((p, d)) } }
-        guard !samples.isEmpty else { return nil }
-        let median = samples.map { $0.1 }.sorted()[samples.count / 2]
-        guard samples.count >= 3 else { return { _ in median } }
-        let centre = samples.reduce(SIMD2<Float>()) { $0 + $1.0 } / Float(samples.count)
-        var ata = simd_double3x3(), atb = SIMD3<Double>()
-        for (p, d) in samples {
-            let v = SIMD3<Double>(1, Double(p.x - centre.x), Double(p.y - centre.y))
-            ata += simd_double3x3(rows: [v * v.x, v * v.y, v * v.z])
-            atb += v * Double(d)
-        }
-        guard abs(ata.determinant) > 1e-6 else { return { _ in median } }
-        let c = ata.inverse * atb
-        return { p in Float(c.x + c.y * Double(p.x - centre.x) + c.z * Double(p.y - centre.y)) }
-    }
-
 
     private func pickHand(_ hands: [VNHumanHandPoseObservation]) -> VNHumanHandPoseObservation? {
         guard !hands.isEmpty else { return nil }
@@ -241,18 +263,19 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
             entity.isEnabled = false
             return
         }
-        var uvs: [SIMD2<Float>] = []
-        uvs.reserveCapacity(positions.count)
-        for iy in 0...segments {
-            for ix in 0...segments { uvs.append(SIMD2(Float(ix) / Float(segments), 1 - Float(iy) / Float(segments))) }
-        }
         var descriptor = MeshDescriptor(name: "wound")
         descriptor.positions = MeshBuffers.Positions(positions)
-        descriptor.textureCoordinates = MeshBuffers.TextureCoordinates(uvs)
+        descriptor.textureCoordinates = MeshBuffers.TextureCoordinates(result.uvs)
         descriptor.primitives = .triangles(result.indices)
         if let mesh = try? MeshResource.generate(from: [descriptor]) {
             entity.model?.mesh = mesh
             entity.isEnabled = true
+        }
+        if abs(result.tint - appliedTint) > 0.01 {
+            appliedTint = result.tint
+            let k = CGFloat(result.tint)
+            material.color.tint = UIColor(red: k, green: k, blue: k, alpha: 0.999)
+            entity.model?.materials = [material]
         }
     }
 }

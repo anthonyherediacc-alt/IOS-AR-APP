@@ -71,6 +71,16 @@ Device test 1 (iPhone, iOS 27): app runs, wound lands on the back of the hand an
 Bug found from screen recording: wound flickered/partly vanished with a still hand while status stayed empty → ARKit people
 occlusion's ML depth for the wound hand itself sat in front of the LiDAR skin. Fix: people occlusion off; occlusion from LiDAR
 instead (grid cells whose measured depth is >1.2 cm in front of a least-squares skin-depth plane through the joints are dropped).
+Device test 2 (screen recording): wound still not "on" the hand — (1) zig-zag tearing: each vertex used its own raw LiDAR depth
+(noise + plane fallback mixed per vertex → parallax when the phone moves); (2) false holes on an open hand: the plane missed the
+hand's curvature; (3) wound hung past the hand's outline; (4) unlit wound brighter than the dim skin.
+Fix: one smooth quadratic depth surface d(x,y) per frame, least squares with iterative outlier rejection (seed = median joint
+depth → plane within 6 cm → quadratic within 2 cm → within 1 cm), every vertex on it (no per-vertex noise); visibility margin per
+vertex (measured >1.2 cm in front = other hand, >2 cm behind = past the hand's edge), clamped to ±5 mm, and grid triangles clipped
+at its zero line (Sutherland–Hodgman, interpolated edge vertices → smooth cut-outs instead of grid steps); grid 16→24; wound tint =
+camera luma under the visible wound ÷ 0.55, clamped 0.25–1, smoothed. Textbook algorithms, own code (no new third-party code).
+Still open: wound is computed from the frame Vision just finished (≈1 frame behind the live camera when the hand moves);
+no motion blur; brightness is one value for the whole wound (no shading gradient across it).
 
 ## Next task
-Real-iPhone test of surface lock + Adjust panel; then occlusion (if needed). Panel settings/picture are not saved across reloads.
+Native app device test 3 (smooth surface, edge clipping, brightness match). Web: panel settings/picture are not saved across reloads.

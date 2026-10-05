@@ -1,3 +1,4 @@
+import CoreVideo
 import Foundation
 import simd
 
@@ -65,8 +66,8 @@ struct ThinPlateSpline {
             m[i][n] = 1; m[i][n + 1] = Double(src[i].x); m[i][n + 2] = Double(src[i].y)
             m[n][i] = 1; m[n + 1][i] = Double(src[i].x); m[n + 2][i] = Double(src[i].y)
         }
-        guard let sx = ThinPlateSpline.solve(m, dst.map { Double($0.x) } + [0, 0, 0]),
-              let sy = ThinPlateSpline.solve(m, dst.map { Double($0.y) } + [0, 0, 0]) else { return nil }
+        guard let sx = solveLinearSystem(m, dst.map { Double($0.x) } + [0, 0, 0]),
+              let sy = solveLinearSystem(m, dst.map { Double($0.y) } + [0, 0, 0]) else { return nil }
         controlPoints = src
         wx = sx[0..<n].map { Float($0) }
         wy = sy[0..<n].map { Float($0) }
@@ -86,30 +87,106 @@ struct ThinPlateSpline {
         }
         return SIMD2(x, y)
     }
+}
 
-    private static func solve(_ a: [[Double]], _ b: [Double]) -> [Double]? {
-        let n = b.count
-        var m = a, rhs = b
-        for col in 0..<n {
-            var pivot = col
-            for row in (col + 1)..<n where abs(m[row][col]) > abs(m[pivot][col]) { pivot = row }
-            if abs(m[pivot][col]) < 1e-12 { return nil }
-            if pivot != col { m.swapAt(col, pivot); rhs.swapAt(col, pivot) }
-            for row in (col + 1)..<n {
-                let f = m[row][col] / m[col][col]
-                if f == 0 { continue }
-                for k in col..<n { m[row][k] -= f * m[col][k] }
-                rhs[row] -= f * rhs[col]
+// Gaussian elimination with partial pivoting (from the thin-plate-spline port above); nil if singular.
+func solveLinearSystem(_ a: [[Double]], _ b: [Double]) -> [Double]? {
+    let n = b.count
+    var m = a, rhs = b
+    for col in 0..<n {
+        var pivot = col
+        for row in (col + 1)..<n where abs(m[row][col]) > abs(m[pivot][col]) { pivot = row }
+        if abs(m[pivot][col]) < 1e-12 { return nil }
+        if pivot != col { m.swapAt(col, pivot); rhs.swapAt(col, pivot) }
+        for row in (col + 1)..<n {
+            let f = m[row][col] / m[col][col]
+            if f == 0 { continue }
+            for k in col..<n { m[row][k] -= f * m[col][k] }
+            rhs[row] -= f * rhs[col]
+        }
+    }
+    var x = [Double](repeating: 0, count: n)
+    for row in stride(from: n - 1, through: 0, by: -1) {
+        var sum = rhs[row]
+        for k in (row + 1)..<n { sum -= m[row][k] * x[k] }
+        x[row] = sum / m[row][row]
+    }
+    return x
+}
+
+// Smooth skin-depth surface over the wound area: depth d(x, y) over image pixels, fitted by least squares
+// with standard iterative outlier rejection. Seeded by the median depth at the hand joints (always on the
+// hand), then: plane through samples within 6 cm (drops the background) → quadratic within 2 cm (drops the
+// other hand in front) → quadratic within 1 cm. One smooth surface for every wound vertex means no tearing
+// from per-sample depth noise, while the quadratic terms keep the back-of-hand curvature.
+struct SkinSurface {
+    private let c: [Double]
+    private let centre: SIMD2<Float>
+    private let scale: Float
+
+    init?(samples: [(SIMD2<Float>, Float)], anchors: [(SIMD2<Float>, Float)]) {
+        let all = samples + anchors
+        guard all.count >= 12 else { return nil }
+        let ctr = all.reduce(SIMD2<Float>()) { $0 + $1.0 } / Float(all.count)
+        let sc = max(all.map { simd_length($0.0 - ctr) }.max() ?? 1, 1)
+        let seed = (anchors.count >= 3 ? anchors : all).map { $0.1 }.sorted()
+        var coeffs: [Double] = [Double(seed[seed.count / 2])]
+        let passes: [(tolerance: Float, terms: Int)] = [(0.06, 3), (0.02, 6), (0.01, 6)]
+        for pass in passes {
+            let kept = all.filter { abs(SkinSurface.eval(coeffs, $0.0, ctr, sc) - $0.1) < pass.tolerance }
+            guard kept.count >= 12, let next = SkinSurface.fit(kept, ctr, sc, terms: pass.terms) else { break }
+            coeffs = next
+        }
+        c = coeffs
+        centre = ctr
+        scale = sc
+    }
+
+    func depth(at p: SIMD2<Float>) -> Float { SkinSurface.eval(c, p, centre, scale) }
+
+    // [1, x, y, x², xy, y²] on centred, scaled pixel coordinates (well-conditioned normal equations).
+    private static func basis(_ p: SIMD2<Float>, _ centre: SIMD2<Float>, _ scale: Float) -> [Double] {
+        let x = Double((p.x - centre.x) / scale), y = Double((p.y - centre.y) / scale)
+        return [1, x, y, x * x, x * y, y * y]
+    }
+
+    private static func eval(_ c: [Double], _ p: SIMD2<Float>, _ centre: SIMD2<Float>, _ scale: Float) -> Float {
+        let t = basis(p, centre, scale)
+        return Float(zip(c, t).reduce(0) { $0 + $1.0 * $1.1 })
+    }
+
+    private static func fit(_ samples: [(SIMD2<Float>, Float)], _ centre: SIMD2<Float>, _ scale: Float,
+                            terms n: Int) -> [Double]? {
+        var ata = [[Double]](repeating: [Double](repeating: 0, count: n), count: n)
+        var atb = [Double](repeating: 0, count: n)
+        for (p, d) in samples {
+            let t = basis(p, centre, scale)
+            for i in 0..<n {
+                atb[i] += t[i] * Double(d)
+                for j in 0..<n { ata[i][j] += t[i] * t[j] }
             }
         }
-        var x = [Double](repeating: 0, count: n)
-        for row in stride(from: n - 1, through: 0, by: -1) {
-            var sum = rhs[row]
-            for k in (row + 1)..<n { sum -= m[row][k] * x[k] }
-            x[row] = sum / m[row][row]
-        }
-        return x
+        for i in 0..<n { ata[i][i] += 1e-6 } // tiny ridge: keeps the solve stable for thin sample sets
+        return solveLinearSystem(ata, atb)
     }
+}
+
+// Mean camera luma (0…1) at the given pixels of capturedImage (plane 0 of its bi-planar YCbCr format).
+func meanLuma(_ image: CVPixelBuffer, at pixels: [SIMD2<Float>]) -> Float? {
+    guard !pixels.isEmpty, CVPixelBufferGetPlaneCount(image) >= 1 else { return nil }
+    CVPixelBufferLockBaseAddress(image, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddressOfPlane(image, 0) else { return nil }
+    let w = CVPixelBufferGetWidthOfPlane(image, 0), h = CVPixelBufferGetHeightOfPlane(image, 0)
+    let row = CVPixelBufferGetBytesPerRowOfPlane(image, 0)
+    var sum = 0, n = 0
+    for p in pixels {
+        let x = Int(p.x), y = Int(p.y)
+        guard x >= 0, y >= 0, x < w, y < h else { continue }
+        sum += Int(base.load(fromByteOffset: y * row + x, as: UInt8.self))
+        n += 1
+    }
+    return n > 0 ? Float(sum) / Float(n) / 255 : nil
 }
 
 // Reads the LiDAR depth map (metres, Float32) at a point of the captured camera image.
