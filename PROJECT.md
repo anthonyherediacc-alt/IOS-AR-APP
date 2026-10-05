@@ -62,11 +62,12 @@ Frame-synced compositing, ported MediaPipe Procrustes pose, landmark 1€ smooth
 ## Native iPhone app (ios/) — LiDAR
 Safari on iPhone has no WebXR AR and no LiDAR access (2026), so depth needs a native app.
 SwiftUI + ARKit (`smoothedSceneDepth`, `personSegmentationWithDepth`) + RealityKit + Vision hand pose. (`personSegmentationWithDepth` removed — see device test.)
-Pipeline (current): Vision 21 joints → wrist/MCP depth from a robust skin surface fitted to the LiDAR over the back of
-the hand → joints in world space → 1€ (Swift port) per world coordinate → rigid hand frame (Gram–Schmidt on wrist/MCPs,
-same construction on the template) with hand size frozen after 15 frames → wound grid = fixed hand-frame points →
-projected into the image → LiDAR skin surface under the wound → unproject → world mesh (UnlitMaterial, texture alpha).
-Back/palm: same 2D cross + chirality rule, normalized, with hysteresis. (First version: 2D 1€ + thin-plate spline.)
+Pipeline (current): Vision 21 joints → 1€ (Swift port) on wrist/MCP image points → least-squares affine map hand template →
+image → carried frame to frame by a skin tracker (pyramidal Lucas–Kanade on a 6×7 grid of back-of-hand points, forward–backward
+checked, robust affine refit) and pulled toward the joints' map by 2 %/frame (50 % if they disagree by > 0.35 hand widths) →
+wound grid image positions → LiDAR skin surface under the wound → unproject → world mesh (UnlitMaterial, texture alpha).
+Back/palm: same 2D cross + chirality rule (chirality = majority of Vision's labels over the track), normalized, with hysteresis.
+History: v1 2D 1€ + thin-plate spline; v3 3D rigid frame from LiDAR joint depths (removed, see device test 3).
 Build: XcodeGen `ios/project.yml` + `.github/workflows/ios.yml` on `macos-15` → unsigned `WoundAR.ipa`
 artifact → sideload from Windows with Sideloadly (free Apple ID = 7-day signing). See `ios/README.md`.
 Device test 1 (iPhone, iOS 27): app runs, wound lands on the back of the hand and follows it; chirality/dorsal rule correct.
@@ -90,6 +91,20 @@ drops < 0.7 s. Simulation (scratch harness: known hand + phone sway + Vision-lik
 wound-centre wander mean/max mm, old → new (1€ 0.3/60/1): still hand 2.7/4.1 → 0.6/1.5; still hand + phone sway
 3.1/5.1 → 0.6/1.3; moving hand 2.3/4.9 → 1.5/3.1; both 2.7/6.4 → 2.0/3.5. At 3× noise the slow joint bias dominates
 (still 3.5/8.5 → 1.9/5.1): next step for true skin lock = image registration/optical flow on the skin, fused with joints.
+Device test 3 (screen recording, right hand): "worst attempt yet" — the wound spun (45–90°) and stretched from frame to frame,
+and the first 3 s said "palm facing" while the back of the hand was shown. Causes: (1) the 3D hand frame's orientation came from
+LiDAR depth differences between joints; sceneDepth is ML-fused from sparse dots and unreliable at 20–50 cm (developer reports:
+inaccurate below ~0.7–1 m), so the frame tilted and the projected wound rotated/foreshortened — the simulation had assumed 1 mm
+depth noise; (2) chirality locked from the first (wrong) Vision label — MediaPipe on the same footage flips left/right on ~1/3
+of frames. Fix: wound image shape never depends on LiDAR depth again (image-space affine map); permanence from tracking the skin
+texture instead (own pyramidal LK, Bouguet 2000 — validated against OpenCV calcOpticalFlowPyrLK on the user's footage: median
+0.07 px difference); chirality by majority vote. Measured: on the recording, frame-to-frame skin slip 1.47 → 0.53 mm median
+(joints-only vs skin lock); synthetic test using the user's real skin texture with known motion, blur and Vision-like errors
+(white + wander + pose-dependent bias): wound-centre error mean/p95 2.5/4.8 → 1.5/2.4 mm (normal motion), 3.3/5.9 → 1.9/3.0 mm
+(15 px bias), also holds under fast blurred motion (skin points fall back to joints when tracking fails).
+iPad question (researched, verified): no improvement expected — ARKit sceneDepth is 256×192 @ 60 Hz on every LiDAR device
+(Apple WWDC20/22, ARKitScenes recorded on iPad Pro), the 2020 iPad Pro and iPhone 12 Pro share the LiDAR part, Vision hand pose
+is the same model; iPad is heavier, has no rear ultra-wide (used by world tracking) and the app is iPhone-only (device family 1).
 Still open: wound is computed from the frame Vision just finished (≈1 frame behind the live camera when the hand moves);
 no motion blur; brightness is one value for the whole wound (no shading gradient across it).
 

@@ -50,20 +50,157 @@ final class OneEuroFilter {
     }
 }
 
-// Rigid hand frame from the wrist + 4 MCPs (handTemplate order): origin = their centroid, x toward the index
-// MCP (from the little MCP), y toward the knuckles (wrist → MCP centroid, made perpendicular to x; Gram–Schmidt).
-// Built the same way for the template (z = 0) and for the 3D joints, so a template point q lands on the hand at
-// centre + scale·(⟨q − c, x⟩·X + ⟨q − c, y⟩·Y).
-func handAxes(_ p: [SIMD3<Float>]) -> (centre: SIMD3<Float>, x: SIMD3<Float>, y: SIMD3<Float>)? {
-    guard p.count == 5 else { return nil }
-    let centre = p.reduce(SIMD3<Float>()) { $0 + $1 } / 5
-    let lateral = p[1] - p[4]
-    let forward = (p[1] + p[2] + p[3] + p[4]) / 4 - p[0]
-    guard simd_length(lateral) > 1e-6 else { return nil }
-    let x = simd_normalize(lateral)
-    let y = forward - simd_dot(forward, x) * x
-    guard simd_length(y) > 1e-6 else { return nil }
-    return (centre, x, simd_normalize(y))
+// Affine map from hand-template (u, v) to image pixels: x = ⟨x, (u, v, 1)⟩, y = ⟨y, (u, v, 1)⟩.
+struct Affine2D {
+    var x: SIMD3<Float>
+    var y: SIMD3<Float>
+
+    func apply(_ q: SIMD2<Float>) -> SIMD2<Float> {
+        let h = SIMD3<Float>(q.x, q.y, 1)
+        return SIMD2(simd_dot(x, h), simd_dot(y, h))
+    }
+
+    func blended(toward other: Affine2D, by a: Float) -> Affine2D {
+        Affine2D(x: x + a * (other.x - x), y: y + a * (other.y - y))
+    }
+
+    // Least squares through point pairs (needs ≥ 3 non-collinear points).
+    static func fit(_ src: [SIMD2<Float>], _ dst: [SIMD2<Float>]) -> Affine2D? {
+        guard src.count >= 3, src.count == dst.count else { return nil }
+        var ata = [[Double]](repeating: [Double](repeating: 0, count: 3), count: 3)
+        var bx = [Double](repeating: 0, count: 3), by = bx
+        for (s, d) in zip(src, dst) {
+            let h = [Double(s.x), Double(s.y), 1]
+            for i in 0..<3 {
+                bx[i] += h[i] * Double(d.x)
+                by[i] += h[i] * Double(d.y)
+                for j in 0..<3 { ata[i][j] += h[i] * h[j] }
+            }
+        }
+        guard let cx = solveLinearSystem(ata, bx), let cy = solveLinearSystem(ata, by) else { return nil }
+        return Affine2D(x: SIMD3(Float(cx[0]), Float(cx[1]), Float(cx[2])),
+                        y: SIMD3(Float(cy[0]), Float(cy[1]), Float(cy[2])))
+    }
+}
+
+// Luma (Y plane) pyramid of a camera frame for the skin tracker: level 0 = half resolution (2×2 box average),
+// each further level halves again.
+struct LumaPyramid {
+    struct Level {
+        let width: Int
+        let height: Int
+        let pixels: [Float]
+
+        // Bilinear sample, clamped to the image.
+        @inline(__always) func sample(_ x: Float, _ y: Float) -> Float {
+            let cx = min(max(x, 0), Float(width) - 1.001), cy = min(max(y, 0), Float(height) - 1.001)
+            let x0 = Int(cx), y0 = Int(cy)
+            let tx = cx - Float(x0), ty = cy - Float(y0)
+            let i = y0 * width + x0
+            let top = pixels[i] * (1 - tx) + pixels[i + 1] * tx
+            let bottom = pixels[i + width] * (1 - tx) + pixels[i + width + 1] * tx
+            return top * (1 - ty) + bottom * ty
+        }
+    }
+
+    let levels: [Level]
+
+    init?(_ image: CVPixelBuffer, levelCount: Int = 4) {
+        CVPixelBufferLockBaseAddress(image, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
+        guard let luma = LumaPlane(locked: image) else { return nil }
+        let w = luma.width / 2, h = luma.height / 2
+        guard w >= 16, h >= 16 else { return nil }
+        var level0 = [Float](repeating: 0, count: w * h)
+        level0.withUnsafeMutableBufferPointer { dst in
+            for y in 0..<h {
+                for x in 0..<w {
+                    let sum = luma.at(2 * x, 2 * y) + luma.at(2 * x + 1, 2 * y)
+                        + luma.at(2 * x, 2 * y + 1) + luma.at(2 * x + 1, 2 * y + 1)
+                    dst[y * w + x] = Float(sum) * 0.25
+                }
+            }
+        }
+        var levels = [Level(width: w, height: h, pixels: level0)]
+        while levels.count < levelCount, let last = levels.last, last.width >= 16, last.height >= 16 {
+            levels.append(LumaPyramid.half(last))
+        }
+        self.levels = levels
+    }
+
+    private static func half(_ l: Level) -> Level {
+        let w = l.width / 2, h = l.height / 2
+        var out = [Float](repeating: 0, count: w * h)
+        l.pixels.withUnsafeBufferPointer { src in
+            for y in 0..<h {
+                for x in 0..<w {
+                    let i = 2 * y * l.width + 2 * x
+                    out[y * w + x] = 0.25 * (src[i] + src[i + 1] + src[i + l.width] + src[i + l.width + 1])
+                }
+            }
+        }
+        return Level(width: w, height: h, pixels: out)
+    }
+}
+
+// Pyramidal Lucas–Kanade point tracker (Bouguet 2000, "Pyramidal implementation of the affine Lucas Kanade
+// feature tracker", translation model, as in OpenCV's calcOpticalFlowPyrLK): follows a 15×15 skin patch from one
+// frame to the next, coarse to fine. Points are in level-0 (half-resolution) pixels. Validated against OpenCV on
+// the user's recording (median difference 0.07 px).
+enum SkinFlow {
+    static let half = 7
+    static let iterations = 10
+    static let epsilon: Float = 0.01
+    static let minEigen: Float = 1e-3
+
+    static func track(_ p: SIMD2<Float>, from prev: LumaPyramid, to cur: LumaPyramid) -> SIMD2<Float>? {
+        let n = (2 * half + 1) * (2 * half + 1)
+        var iv = [Float](repeating: 0, count: n), ix = iv, iy = iv
+        var g = SIMD2<Float>(0, 0)
+        for level in (0..<min(prev.levels.count, cur.levels.count)).reversed() {
+            let a = prev.levels[level], b = cur.levels[level]
+            let c = p / Float(1 << level)
+            guard c.x >= Float(half + 1), c.y >= Float(half + 1),
+                  c.x < Float(a.width - half - 2), c.y < Float(a.height - half - 2) else { return nil }
+            var gxx: Float = 0, gxy: Float = 0, gyy: Float = 0
+            var k = 0
+            for dy in -half...half {
+                for dx in -half...half {
+                    let x = c.x + Float(dx), y = c.y + Float(dy)
+                    iv[k] = a.sample(x, y)
+                    ix[k] = 0.5 * (a.sample(x + 1, y) - a.sample(x - 1, y))
+                    iy[k] = 0.5 * (a.sample(x, y + 1) - a.sample(x, y - 1))
+                    gxx += ix[k] * ix[k]
+                    gxy += ix[k] * iy[k]
+                    gyy += iy[k] * iy[k]
+                    k += 1
+                }
+            }
+            let det = gxx * gyy - gxy * gxy
+            let minEig = (gxx + gyy - ((gxx - gyy) * (gxx - gyy) + 4 * gxy * gxy).squareRoot()) / 2 / Float(n)
+            guard det > 1e-6, minEig > minEigen else { return nil } // textureless patch
+            var v = SIMD2<Float>(0, 0)
+            for _ in 0..<iterations {
+                var bx: Float = 0, by: Float = 0
+                k = 0
+                for dy in -half...half {
+                    for dx in -half...half {
+                        let e = iv[k] - b.sample(c.x + g.x + v.x + Float(dx), c.y + g.y + v.y + Float(dy))
+                        bx += e * ix[k]
+                        by += e * iy[k]
+                        k += 1
+                    }
+                }
+                let eta = SIMD2<Float>((gyy * bx - gxy * by) / det, (gxx * by - gxy * bx) / det)
+                v += eta
+                if abs(eta.x) < epsilon && abs(eta.y) < epsilon { break }
+            }
+            g = level == 0 ? g + v : 2 * (g + v)
+        }
+        let q = p + g
+        guard let l0 = cur.levels.first, q.x >= 0, q.y >= 0, q.x < Float(l0.width), q.y < Float(l0.height) else { return nil }
+        return q
+    }
 }
 
 // Gaussian elimination with partial pivoting, ported from the thin-plate-spline package's solver
@@ -149,19 +286,43 @@ struct SkinSurface {
     }
 }
 
-// Mean camera luma (0…1) at the given pixels of capturedImage (plane 0 of its bi-planar YCbCr format).
+// Luma (plane 0) of capturedImage as 8-bit values. ARKit delivers 8-bit bi-planar YCbCr; 10-bit formats store
+// each sample in the high bits of a 16-bit word, so their top 8 bits are used. Only valid while the buffer is locked.
+struct LumaPlane {
+    let base: UnsafeRawPointer
+    let width: Int
+    let height: Int
+    let rowBytes: Int
+    let wide: Bool
+
+    init?(locked image: CVPixelBuffer) {
+        guard CVPixelBufferGetPlaneCount(image) >= 1, let b = CVPixelBufferGetBaseAddressOfPlane(image, 0) else { return nil }
+        let format = CVPixelBufferGetPixelFormatType(image)
+        base = UnsafeRawPointer(b)
+        width = CVPixelBufferGetWidthOfPlane(image, 0)
+        height = CVPixelBufferGetHeightOfPlane(image, 0)
+        rowBytes = CVPixelBufferGetBytesPerRowOfPlane(image, 0)
+        wide = format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+            || format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+    }
+
+    @inline(__always) func at(_ x: Int, _ y: Int) -> Int {
+        wide ? Int(base.load(fromByteOffset: y * rowBytes + 2 * x, as: UInt16.self) >> 8)
+             : Int(base.load(fromByteOffset: y * rowBytes + x, as: UInt8.self))
+    }
+}
+
+// Mean camera luma (0…1) at the given pixels of capturedImage.
 func meanLuma(_ image: CVPixelBuffer, at pixels: [SIMD2<Float>]) -> Float? {
-    guard !pixels.isEmpty, CVPixelBufferGetPlaneCount(image) >= 1 else { return nil }
+    guard !pixels.isEmpty else { return nil }
     CVPixelBufferLockBaseAddress(image, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
-    guard let base = CVPixelBufferGetBaseAddressOfPlane(image, 0) else { return nil }
-    let w = CVPixelBufferGetWidthOfPlane(image, 0), h = CVPixelBufferGetHeightOfPlane(image, 0)
-    let row = CVPixelBufferGetBytesPerRowOfPlane(image, 0)
+    guard let luma = LumaPlane(locked: image) else { return nil }
     var sum = 0, n = 0
     for p in pixels {
         let x = Int(p.x), y = Int(p.y)
-        guard x >= 0, y >= 0, x < w, y < h else { continue }
-        sum += Int(base.load(fromByteOffset: y * row + x, as: UInt8.self))
+        guard x >= 0, y >= 0, x < luma.width, y < luma.height else { continue }
+        sum += luma.at(x, y)
         n += 1
     }
     return n > 0 ? Float(sum) / Float(n) / 255 : nil

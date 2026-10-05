@@ -9,4 +9,4 @@
 - **svd-js** (`js/vendor/svd.js`) — Copyright 2017 Danilo Salvati. MIT; license text is in the file header.
 - **Three.js** r170 — Copyright 2010-2024 Three.js Authors. MIT (https://github.com/mrdoob/three.js/blob/dev/LICENSE). Loaded from a CDN.
 - **thin-plate-spline** (`js/vendor/thin-plate-spline.js`) — Copyright 2026 pravoobi. MIT; license text is in the file header.
-- Native app (`ios/WoundAR/HandMath.swift`) contains Swift ports of the OneEuroFilter (BSD-3-Clause, Inria / Géry Casiez) and of the thin-plate-spline package's linear solver (MIT, pravoobi) listed above.
+- Native app (`ios/WoundAR/HandMath.swift`) contains Swift ports of the OneEuroFilter (BSD-3-Clause, Inria / Géry Casiez) and of the thin-plate-spline package's linear solver (MIT, pravoobi) listed above. Its skin tracker implements the published pyramidal Lucas–Kanade algorithm (J.-Y. Bouguet, "Pyramidal Implementation of the Affine Lucas Kanade Feature Tracker", Intel, 2000) from the paper; no third-party code.
