@@ -1,4 +1,4 @@
-import { WOUNDS, SETTINGS, TRACKING, RENDER } from "./config.js";
+import { WOUNDS, SETTINGS, TRACKING } from "./config.js";
 import {
   vision, createHandLandmarker, createPose, getHandPose, createLandmarkSmoother, projectLocal, getDorsalVisibility,
   getFacingLabel, TEMPLATE,
@@ -47,24 +47,25 @@ function cameraErrorMessage(e) {
 
 async function start() {
   startBtn.disabled = true;
-  try {
-    renderer = createRenderer(view);
-  } catch (e) {
-    console.error(e);
-  }
-  if (!renderer) {
-    setStatus("This browser can't run WebGL2, which is needed to draw the wound.");
-    return;
-  }
   view.addEventListener("webglcontextlost", (e) => { e.preventDefault(); setStatus("Graphics were reset by the browser. Reload the page."); });
   setStatus("Starting camera…");
-  const trackerPromise = createHandLandmarker(); // load in parallel with camera prompt
+  // Load tracking and the 3D renderer in parallel with the camera prompt.
+  const trackerPromise = createHandLandmarker(), rendererPromise = createRenderer(view);
   trackerPromise.catch(() => {}); // handled below; avoid unhandled-rejection noise
+  rendererPromise.catch(() => {});
   try {
     await startCamera();
   } catch (e) {
     setStatus(cameraErrorMessage(e));
     startBtn.disabled = false;
+    return;
+  }
+  setStatus("Loading 3D renderer…");
+  try {
+    renderer = await rendererPromise;
+  } catch (e) {
+    console.error(e);
+    setStatus(`3D renderer failed to start (${e.message || e}). WebGL2 and a network connection are required.`);
     return;
   }
   setStatus("Loading hand tracking…");
@@ -123,15 +124,15 @@ async function processFrame() {
   // so normalized landmark × video size lands exactly on the displayed frame.
   if (canvas.width !== w || canvas.height !== h) {
     canvas.width = w; canvas.height = h;
-    renderer.resize(w, h);
     cam.f = TRACKING.focalLength * Math.max(w, h); cam.cx = w / 2; cam.cy = h / 2;
+    renderer.resize(w, h, cam);
   }
 
   const now = performance.now();
   const result = landmarker.detectForVideo(frameImg, now);
   inferMs = performance.now() - now;
-  renderer.drawCamera(frameImg, w, h);
-  if (frameImg !== video) frameImg.close();
+  renderer.setFrame(frameImg);
+  renderer.hideWound();
   ctx.clearRect(0, 0, w, h);
 
   const lm = result.landmarks[0];
@@ -151,10 +152,12 @@ async function processFrame() {
     // Smooth the landmarks, then solve the pose once from them (MediaPipe's order of operations).
     if (getHandPose(smoother.apply(lm, w, h, now / 1000), isRight, w, h, cam, pose)) {
       const alpha = getDorsalVisibility(visibility, pose.facing, TRACKING);
-      renderer.drawWound(currentWound(), pose, cam, alpha, RENDER);
+      renderer.setWound(currentWound(), pose, alpha);
       if (SETTINGS.debug && getHandPose(lm, isRight, w, h, cam, raw)) drawDebug(lm, hd, isRight, alpha);
     }
   }
+  renderer.render();
+  if (frameImg !== video) frameImg.close(); // after render: the texture upload happens inside render()
   updateFps();
 }
 

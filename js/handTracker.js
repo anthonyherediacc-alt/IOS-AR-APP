@@ -171,9 +171,12 @@ function finishPose(p) {
   p.facing = -(x[0] * y[1] - x[1] * y[0]) / ((p2 + q2) / 2 + Math.sqrt(((p2 - q2) / 2) ** 2 + r * r));
 }
 
-// Hand-local (u, v) in hand widths → video pixels (out[k], out[k+1]) and camera depth (out[k+2]).
-export function projectLocal(p, cam, u, v, out, k) {
-  const X = p.o[0] + u * p.x[0] + v * p.y[0], Y = p.o[1] + u * p.x[1] + v * p.y[1], Z = p.o[2] + u * p.x[2] + v * p.y[2];
+// Hand-local (u, v, lift along the dorsal normal) in hand widths → video pixels (out[k], out[k+1])
+// and camera depth (out[k+2]).
+export function projectLocal(p, cam, u, v, out, k, lift = 0) {
+  const X = p.o[0] + u * p.x[0] + v * p.y[0] + lift * p.n[0];
+  const Y = p.o[1] + u * p.x[1] + v * p.y[1] + lift * p.n[1];
+  const Z = p.o[2] + u * p.x[2] + v * p.y[2] + lift * p.n[2];
   out[k] = cam.cx + (cam.f * X) / Z; out[k + 1] = cam.cy + (cam.f * Y) / Z; out[k + 2] = Z;
 }
 
