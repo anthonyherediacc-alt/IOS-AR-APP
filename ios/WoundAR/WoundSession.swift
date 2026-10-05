@@ -1,68 +1,75 @@
 import ARKit
 import Combine
-import RealityKit
 import UIKit
 import Vision
 
-// Wound placement, same meaning as the web app's js/config.js entry for "laceration":
-// scale = width in hand widths; offsets in hand widths (+x toward the index finger, +y toward the fingers).
-private enum Wound {
-    static let image = "laceration"
-    static let scale: Float = 0.45
-    static let rotationDegrees: Float = 20
-    static let xOffset: Float = 0
-    static let yOffset: Float = 0
-    // LiDAR occlusion against the fitted skin surface: a wound point is hidden where the measured depth is
-    // this much closer (something in front, e.g. the other hand) or this much farther (background: the point
-    // is past the hand's outline, so there is no skin to draw on).
-    static let occluderMargin: Float = 0.012
-    static let offHandMargin: Float = 0.02
-    // The visibility margin is clamped to ±this before the mesh is cut, so a cut edge between a clearly
-    // visible and a clearly hidden vertex lands halfway between them (a smooth outline, not grid steps).
-    static let edgeClamp: Float = 0.005
-    // Brightness matching: the wound is tinted by (skin luma under it ÷ this reference), clamped.
-    static let referenceLuma: Float = 0.55
-    static let tintRange: ClosedRange<Float> = 0.25...1
+// Toggles in the app's side panel, so each improvement can be tested on its own.
+struct WoundSettings: Equatable {
+    var frameSync = true // draw the camera frame the wound was computed from (glued) vs the newest frame (follows)
+    var skinLock = true // follow the skin texture (off: hand joints only)
+    var deformable = true // bending/stretching skin mesh (off: one rigid patch)
+    var handOcclusion = true // the other hand covers the wound
+    var depthOcclusion = true // LiDAR: hide where something is in front, or where the hand ends
+    var skinBlend = true // shade with the skin, halo tints the skin (off: plain picture)
+    var debug = false
 }
 
-// Which hand, and which side of it, we are looking at.
+// Debug overlay data, in camera-image pixels.
+struct DebugInfo {
+    var imageSize = SIMD2<Float>(1, 1)
+    var rawJoints: [SIMD2<Float>] = []
+    var smoothedJoints: [SIMD2<Float>] = []
+    var nodes: [SIMD2<Float>] = []
+    var nodeTrust: [Float] = []
+    var outlineRaw: [SIMD2<Float>] = [] // wound outline from the raw joints (raw pose)
+    var outlineAnchor: [SIMD2<Float>] = [] // from the 1€-smoothed joints (filtered pose)
+    var outlineFinal: [SIMD2<Float>] = [] // the drawn wound (skin mesh)
+    var axisOrigin = SIMD2<Float>(0, 0)
+    var axisU = SIMD2<Float>(0, 0) // local surface axes (across / along the hand), image vectors
+    var axisV = SIMD2<Float>(0, 0)
+    var normal = SIMD2<Float>(0, 0) // image-plane lean of the estimated surface normal
+    var capsules: [Capsule] = []
+    var lines: [String] = []
+}
+
 private enum Tracking {
-    static let forgetAfter: TimeInterval = 0.7 // keep the hand's identity through brief tracking drops
+    static let forgetAfter: TimeInterval = 0.7 // keep the hand's identity through brief detection drops
     static let maxJump: Float = 2 // a hand this many hand widths from the last one is a different hand
     static let facingHysteresis: Float = 0.15 // back/palm only flips once clearly past edge-on
+    static let lostAt: Float = 0.35 // skin mesh and joints this far apart (hand widths)…
+    static let lostFrames = 3 // …for this many frames in a row: fade out and re-acquire (one bad frame never moves it)
+    static let fadeIn: Float = 5 // opacity per second
+    static let fadeOut: Float = 8
+    static let edgeOn: (Float, Float) = (0.12, 0.28) // foreshortening (minor/major axis) fade range
+    static let jointsOnlyConfidence: Float = 0.6 // skin not trackable but joints fine
 }
 
-// Skin lock: the wound follows the skin's own texture (creases, hair, veins) from frame to frame, and the hand
-// joints only pull it gently back toward their estimate — joints wander with hand pose, skin texture doesn't.
-private enum Skin {
-    // Tracked points: a 6 × 7 grid over the back of the hand, in hand-template units (between wrist and knuckles).
-    static let grid: [SIMD2<Float>] = (0..<7).flatMap { j in
-        (0..<6).map { i in SIMD2<Float>(-0.35 + 0.14 * Float(i), -0.65 + 0.85 * Float(j) / 6) }
-    }
-    static let alpha: Float = 0.02 // per-frame pull toward the joints while the skin is tracked
-    static let snapAlpha: Float = 0.5 // pull when skin and joints disagree by more than lostAt hand widths
-    static let lostAt: Float = 0.35
-    static let minPoints = 8 // fewer good skin points → use the joints
-    static let forwardBackwardMax: Float = 1 // half-res px: a point must track back to where it started
-    static let residualMax: Float = 6 // px: points not moving with the rest (other hand, background) are dropped
-}
-
-private let segments = 24 // wound grid resolution per side (also the resolution of occlusion edges)
 private let joints: [VNHumanHandPoseObservation.JointName] = [.wrist, .indexMCP, .middleMCP, .ringMCP, .littleMCP]
+private let segS = 12, segT = 30 // render mesh resolution (across, along the wound)
 
-// ARKit + Vision + LiDAR pipeline:
-//   camera frame → Vision hand pose (21 joints, chirality) → 1€-smoothed wrist/MCP image points → affine map from
-//   the hand template to the image, carried from frame to frame by tracking the skin texture (Lucas–Kanade) and
-//   pulled gently toward the joints → every wound-grid vertex gets an image position → one smooth skin surface
-//   fitted robustly to the LiDAR depth under the wound → unproject to world space. Occlusion also comes from the
-//   LiDAR depth: grid cells where something is in front of the skin, or where the hand ends, are dropped. The
-//   wound is tinted to the skin's measured brightness.
-// (A 3D hand frame built from LiDAR joint depths was tried and removed: close-range depth errors tilted it, so
-// the wound spun and stretched on device. The wound's image shape now never depends on LiDAR depth.)
-// (ARKit people occlusion was tried first: its ML depth for the wound hand itself kept landing in front of
-// the LiDAR skin surface, so the hand hid its own wound — visible flicker in the first device test.)
+private func ramp(_ a: Float, _ b: Float, _ x: Float) -> Float {
+    let t = min(max((x - a) / (b - a), 0), 1)
+    return t * t * (3 - 2 * t)
+}
+
+// Pipeline (vision queue, one camera frame at a time):
+//   Vision hand pose → pick the wound hand → back/palm → 1€-smoothed joints → affine "anchor" (where the joints put
+//   the wound) → SurfaceTracker: control grid carried and bent by the skin texture, weakly anchored to the joints →
+//   render mesh (Catmull–Rom on the grid) in camera-image coordinates → confidence → opacity → occluders (other
+//   hand capsules, LiDAR) → RenderFrame with THIS camera frame, drawn by Renderer (frame-synced).
+// LiDAR depth never sets the wound's shape or position (unreliable at 20–50 cm; it made the wound spin in device
+// test 3); it only decides what is in front of the hand or past its edge.
 final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
     @Published var status = "Point the camera at the back of your hand."
+    @Published var settings = WoundSettings() {
+        didSet { applySettingsToRenderer() }
+    }
+    @Published var debug: DebugInfo?
+
+    let session = ARSession()
+    private(set) var renderFrame: RenderFrame? // main thread
+    private weak var renderer: Renderer?
+    private var cachedTransform: (size: CGSize, transform: CGAffineTransform)?
 
     private let visionQueue = DispatchQueue(label: "wound.vision")
     private var busy = false
@@ -71,260 +78,341 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
         r.maximumHandCount = 2
         return r
     }()
-    private let anchor = AnchorEntity(world: .zero)
-    private var woundEntity: ModelEntity?
-    private var aspect: Float = 1
-    private var material = UnlitMaterial()
-    private var appliedTint: Float = 1 // tint currently on the material (main)
+    private var placement = WoundPlacement()
 
-    // Tracking state (vision queue).
-    private var tint: Float = 1 // smoothed brightness factor
+    // Tracking state (vision queue only).
+    private let tracker = SurfaceTracker()
     private let filters = (0..<10).map { _ in OneEuroFilter(minCutoff: 0.1, beta: 10, dCutoff: 2) }
-    private var leftVotes = 0 // Vision's left/right label flips on some frames: majority over the current track
+    private var leftVotes = 0 // Vision's left/right label flips on some frames: majority over the track
+    private var disagreeing = 0 // consecutive frames with skin mesh and joints far apart
     private var lastCentroid: SIMD2<Float>?
     private var lastHandSize: Float = 1
     private var lastSeen: TimeInterval = 0
+    private var lastTime: TimeInterval = 0
     private var dorsal: Bool?
-    private var mapping: Affine2D? // hand template → image, from the previous processed frame
-    private var mappingLeft = false // which template side (left/right hand) that map was made with
+    private var trackerLeft = false
     private var previousPyramid: LumaPyramid?
+    private var opacity: Float = 0
+    private var referenceLuma: Float = 0.5
+    private var imageSize = SIMD2<Float>(1920, 1440)
 
-    func attach(to view: ARView) {
+    // MARK: Setup (main thread)
+
+    func attach(renderer: Renderer) {
+        self.renderer = renderer
+        renderer.currentFrame = { [weak self] in self?.renderFrame }
+        renderer.liveImage = { [weak self] in self?.session.currentFrame?.capturedImage }
+        renderer.displayTransform = { [weak self] size in self?.displayTransform(for: size) }
+        applySettingsToRenderer()
+        if let url = Bundle.main.url(forResource: "laceration", withExtension: "png"),
+           let cg = UIImage(contentsOfFile: url.path)?.cgImage {
+            placement.aspect = Float(cg.height) / Float(cg.width)
+        }
         let config = ARWorldTrackingConfiguration()
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
             config.frameSemantics.insert(.smoothedSceneDepth)
-        } else {
-            status = "This iPhone has no LiDAR scanner (needs a Pro model)."
         }
-        view.session.delegate = self
-        view.scene.addAnchor(anchor)
-        setUpWoundEntity()
-        view.session.run(config)
+        session.delegate = self
+        session.run(config)
     }
 
-    private func setUpWoundEntity() {
-        guard let url = Bundle.main.url(forResource: Wound.image, withExtension: "png"),
-              let image = UIImage(contentsOfFile: url.path), let cg = image.cgImage,
-              let texture = try? TextureResource.generate(from: cg, options: .init(semantic: .color)) else {
-            status = "Could not load the wound image."
-            return
-        }
-        aspect = Float(cg.height) / Float(cg.width)
-        // A tint alpha just below 1 makes RealityKit honour the texture's alpha channel.
-        material.color = .init(tint: UIColor.white.withAlphaComponent(0.999), texture: .init(texture))
-        material.blending = .transparent(opacity: .init(floatLiteral: 1))
-        let entity = ModelEntity(mesh: .generatePlane(width: 0.01, depth: 0.01), materials: [material])
-        entity.isEnabled = false
-        anchor.addChild(entity)
-        woundEntity = entity
+    private func applySettingsToRenderer() {
+        renderer?.frameSync = settings.frameSync
+        renderer?.blendSkin = settings.skinBlend
+        renderer?.debugTint = settings.debug
+        if !settings.debug { debug = nil }
+    }
+
+    // Normalized camera image → normalized view (aspect fill, portrait). The same for every frame of a session.
+    func displayTransform(for size: CGSize) -> CGAffineTransform? {
+        if let c = cachedTransform, c.size == size { return c.transform }
+        guard size.width > 0, size.height > 0, let frame = session.currentFrame else { return nil }
+        let t = frame.displayTransform(for: .portrait, viewportSize: size)
+        cachedTransform = (size, t)
+        return t
     }
 
     // MARK: ARSessionDelegate (main thread)
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        guard !busy, let depth = frame.smoothedSceneDepth?.depthMap ?? frame.sceneDepth?.depthMap else { return }
+        guard !busy else { return }
         busy = true
-        // Copy what we need instead of holding on to the ARFrame.
         let image = frame.capturedImage
-        let intrinsics = frame.camera.intrinsics
-        let cameraTransform = frame.camera.transform
-        let resolution = SIMD2<Float>(Float(frame.camera.imageResolution.width), Float(frame.camera.imageResolution.height))
+        let depth = frame.smoothedSceneDepth?.depthMap ?? frame.sceneDepth?.depthMap
         let time = frame.timestamp
+        let settings = self.settings
         visionQueue.async { [weak self] in
             guard let self else { return }
-            let result = self.computeWound(image: image, depth: depth, intrinsics: intrinsics,
-                                           cameraTransform: cameraTransform, resolution: resolution, time: time)
+            let output = self.process(image: image, depth: depth, time: time, settings: settings)
             DispatchQueue.main.async {
-                self.apply(result)
+                if self.status != output.status { self.status = output.status }
+                self.renderFrame = output.frame
+                if settings.debug, self.settings.debug { self.debug = output.debug }
                 self.busy = false
             }
         }
     }
 
-    // MARK: Wound geometry (vision queue)
+    // MARK: Per-frame processing (vision queue)
 
-    private struct Result {
-        var positions: [SIMD3<Float>]?
-        var uvs: [SIMD2<Float>] = []
-        var indices: [UInt32] = []
-        var tint: Float = 1
+    private struct Output {
+        var frame: RenderFrame
         var status: String
+        var debug: DebugInfo?
     }
 
-    private func computeWound(image: CVPixelBuffer, depth: CVPixelBuffer, intrinsics: simd_float3x3,
-                              cameraTransform: simd_float4x4, resolution: SIMD2<Float>, time: TimeInterval) -> Result {
+    private func process(image: CVPixelBuffer, depth: CVPixelBuffer?, time: TimeInterval,
+                         settings: WoundSettings) -> Output {
+        let size = SIMD2<Float>(Float(CVPixelBufferGetWidth(image)), Float(CVPixelBufferGetHeight(image)))
+        imageSize = size
+        let dt = Float(min(max(time - lastTime, 0), 0.1))
+        lastTime = time
+        var info = DebugInfo()
+        info.imageSize = size
+
         // Raw sensor orientation (.up): Vision points then match capturedImage and the depth map directly.
         try? VNImageRequestHandler(cvPixelBuffer: image, orientation: .up).perform([handRequest])
-        guard let picked = pickHand(handRequest.results ?? [], resolution) else {
-            if time - lastSeen > Tracking.forgetAfter { reset() }
-            return Result(positions: nil, status: "Show the back of your hand.")
-        }
-        let (hand, pts) = picked
-        lastSeen = time
-        lastCentroid = pts.reduce(SIMD2<Float>()) { $0 + $1 } / Float(pts.count)
-        let handSize = max(simd_distance(pts[1], pts[4]), 1)
-        lastHandSize = handSize
-        if hand.chirality == .left { leftVotes += 1 } else if hand.chirality == .right { leftVotes -= 1 }
-        let side = leftVotes != 0 ? leftVotes > 0 : hand.chirality == .left
-        // A map made for the other side (the left/right majority just flipped) can't be carried over.
-        let carried = mappingLeft == side ? mapping.flatMap { m in previousPyramid.map { (m, $0) } } : nil
-        mapping = nil
-        previousPyramid = nil
-
-        // Back vs palm: a 2D cross product flips sign between the two sides; chirality tells which is which
-        // (same rule as the web app, confirmed on device). Image y points down. Normalized (sine of the angle)
-        // so the hysteresis band means the same at any distance.
-        let lateral = pts[1] - pts[4]
-        let forward = (pts[1] + pts[2] + pts[3] + pts[4]) / 4 - pts[0]
-        let cross = (lateral.x * forward.y - lateral.y * forward.x) / max(simd_length(lateral) * simd_length(forward), 1)
-        let score = side ? -cross : cross // > 0: back of the hand toward the camera
-        if dorsal == nil || abs(score) > Tracking.facingHysteresis { dorsal = score > 0 }
-        guard dorsal == true else {
-            return Result(positions: nil, status: "Palm facing the camera — turn your hand over.")
-        }
-
-        // 1) Hand template → image from the joints (1€-smoothed, least-squares affine through all five).
-        var smoothed = pts
-        for k in 0..<smoothed.count {
-            filters[2 * k].beta = 10 / Double(handSize)
-            filters[2 * k + 1].beta = 10 / Double(handSize)
-            smoothed[k] = SIMD2(Float(filters[2 * k].filter(Double(pts[k].x), time: time)),
-                                Float(filters[2 * k + 1].filter(Double(pts[k].y), time: time)))
-        }
-        let sgn: Float = side ? 1 : -1 // right hands are mirror images of the (left-hand) template
-        let template = handTemplate.map { SIMD2($0.x * sgn, $0.y) }
-        guard let fromJoints = Affine2D.fit(template, smoothed) else {
-            return Result(positions: nil, status: "Tracking…")
-        }
-
-        // 2) Skin lock: carry last frame's map along the skin texture, then pull it slightly toward the joints.
-        let pyramid = LumaPyramid(image)
-        var current = fromJoints
-        if let carried, let pyramid {
-            let woundCentre = SIMD2<Float>(Wound.xOffset * sgn, Wound.yOffset)
-            current = followSkin(carried.0, from: carried.1, to: pyramid, joints: fromJoints, sgn: sgn,
-                                 handSize: handSize, centre: woundCentre) ?? fromJoints
-        }
-        mapping = current
-        mappingLeft = side
+        let hands = handRequest.results ?? []
+        let picked = pickHand(hands, size)
+        let pyramid = settings.skinLock ? LumaPyramid(image) : nil
+        let before = previousPyramid
         previousPyramid = pyramid
+        let options = SurfaceTracker.Options(skinLock: settings.skinLock, deformable: settings.deformable)
 
-        CVPixelBufferLockBaseAddress(depth, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(depth, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(depth) else { return Result(positions: nil, status: "No depth data.") }
-        let sampler = DepthSampler(base: UnsafeRawPointer(base), width: CVPixelBufferGetWidth(depth),
-                                   height: CVPixelBufferGetHeight(depth), rowBytes: CVPixelBufferGetBytesPerRow(depth),
-                                   imageSize: resolution)
-        let fx = intrinsics[0][0], fy = intrinsics[1][1], cx = intrinsics[2][0], cy = intrinsics[2][1]
-        // ARKit camera space: x right, y up, looking down −z, in the sensor's native (landscape) orientation,
-        // which is also capturedImage's.
-        func unproject(_ p: SIMD2<Float>, _ d: Float) -> SIMD3<Float> {
-            let h = cameraTransform * SIMD4<Float>((p.x - cx) / fx * d, -(p.y - cy) / fy * d, -d, 1)
-            return SIMD3(h.x, h.y, h.z)
-        }
+        var status = ""
+        var confidence: Float = 0
+        var sgn: Float = trackerLeft ? 1 : -1
+        var anchor: Affine2D?
+        var rawAnchor: Affine2D?
+        var handSize = lastHandSize
+        var woundJoints: [SIMD2<Float>] = []
 
-        // 3) Wound grid: picture point → hand-template point → image pixel.
-        let w = Wound.scale, h = w * aspect, t = Wound.rotationDegrees * .pi / 180
-        var pixels: [SIMD2<Float>] = []
-        pixels.reserveCapacity((segments + 1) * (segments + 1))
-        for iy in 0...segments {
-            for ix in 0...segments {
-                let px = (Float(ix) / Float(segments) - 0.5) * w, py = (Float(iy) / Float(segments) - 0.5) * h
-                let rx = px * cos(t) - py * sin(t), ry = px * sin(t) + py * cos(t)
-                pixels.append(current.apply(SIMD2(Wound.xOffset * sgn + rx, Wound.yOffset - ry)))
+        if let picked {
+            let (hand, pts) = picked
+            lastSeen = time
+            lastCentroid = pts.reduce(SIMD2<Float>()) { $0 + $1 } / Float(pts.count)
+            // Hand size robust to rolling (knuckle span shrinks) and pitching (wrist–knuckle length shrinks).
+            handSize = max(simd_distance(pts[1], pts[4]), simd_distance(pts[0], pts[2]) / 1.34, 1)
+            lastHandSize = handSize
+            woundJoints = pts
+            if hand.chirality == .left { leftVotes += 1 } else if hand.chirality == .right { leftVotes -= 1 }
+            // A tied vote keeps the side already in use (the newest label is the minority one on a tie).
+            let side = leftVotes != 0 ? leftVotes > 0 : (tracker.nodes != nil ? trackerLeft : hand.chirality == .left)
+            sgn = side ? 1 : -1
+            if tracker.nodes != nil, trackerLeft != side { tracker.reset() } // template side flipped
+            trackerLeft = side
+
+            // Back vs palm: 2D cross product sign + chirality (confirmed on device), normalized, with hysteresis.
+            let lateral = pts[1] - pts[4]
+            let forward = (pts[1] + pts[2] + pts[3] + pts[4]) / 4 - pts[0]
+            let cross = (lateral.x * forward.y - lateral.y * forward.x) / max(simd_length(lateral) * simd_length(forward), 1)
+            let score = side ? -cross : cross
+            if dorsal == nil || abs(score) > Tracking.facingHysteresis { dorsal = score > 0 }
+
+            var smoothed = pts
+            for k in 0..<pts.count {
+                filters[2 * k].beta = 10 / Double(handSize)
+                filters[2 * k + 1].beta = 10 / Double(handSize)
+                smoothed[k] = SIMD2(Float(filters[2 * k].filter(Double(pts[k].x), time: time)),
+                                    Float(filters[2 * k + 1].filter(Double(pts[k].y), time: time)))
             }
-        }
-        let anchors = pts.compactMap { p in sampler.depth(at: p).map { (p, $0) } }
-        // 4) LiDAR depth there; one smooth skin surface fitted to it, seeded by the depth at the joints.
-        let measured = pixels.map { sampler.depth(at: $0) }
-        let samples = zip(pixels, measured).compactMap { p, m in m.map { (p, $0) } }
-        guard let skin = SkinSurface(samples: samples, anchors: anchors) else {
-            return Result(positions: nil, status: "Hold your hand 20–50 cm from the camera.")
-        }
-        // 5) Every vertex on that surface, plus a visibility margin: positive where the LiDAR sees this skin,
-        //    negative where something is in front (the other hand) or the hand has ended (background).
-        let stride = segments + 1
-        var positions: [SIMD3<Float>] = [], uvs: [SIMD2<Float>] = [], margin: [Float] = []
-        var visiblePixels: [SIMD2<Float>] = []
-        positions.reserveCapacity(pixels.count * 2)
-        uvs.reserveCapacity(pixels.count * 2)
-        for (i, pixel) in pixels.enumerated() {
-            let d = skin.depth(at: pixel)
-            var f = Wound.edgeClamp
-            if let m = measured[i] { f = min(f, m - (d - Wound.occluderMargin), d + Wound.offHandMargin - m) }
-            f = max(f, -Wound.edgeClamp)
-            margin.append(f)
-            if f > 0 { visiblePixels.append(pixel) }
-            positions.append(unproject(pixel, d))
-            uvs.append(SIMD2(Float(i % stride) / Float(segments), 1 - Float(i / stride) / Float(segments)))
-        }
-        // 6) Match the wound's brightness to the skin it sits on (the camera image under the wound).
-        if let luma = meanLuma(image, at: visiblePixels) {
-            let target = min(max(luma / Wound.referenceLuma, Wound.tintRange.lowerBound), Wound.tintRange.upperBound)
-            tint += 0.3 * (target - tint)
-        }
-        // 7) Cut the mesh along the margin's zero line: each grid triangle is clipped against it
-        //    (Sutherland–Hodgman, one clip plane) with new edge vertices interpolated, so the wound's outline
-        //    follows the hand's edge and the other hand's fingers smoothly. Both windings: nothing is culled.
-        var indices: [UInt32] = []
-        for y in 0..<segments {
-            for x in 0..<segments {
-                let a = y * stride + x, b = a + 1, c = a + stride, e = c + 1
-                for tri in [[a, c, b], [b, c, e]] {
-                    var poly: [UInt32] = []
-                    for k in 0..<3 {
-                        let p = tri[k], q = tri[(k + 1) % 3]
-                        if margin[p] >= 0 { poly.append(UInt32(p)) }
-                        if (margin[p] >= 0) != (margin[q] >= 0) {
-                            let s = margin[p] / (margin[p] - margin[q])
-                            positions.append(positions[p] + s * (positions[q] - positions[p]))
-                            uvs.append(uvs[p] + s * (uvs[q] - uvs[p]))
-                            poly.append(UInt32(positions.count - 1))
+            let template = handTemplate.map { SIMD2($0.x * sgn, $0.y) }
+            anchor = Affine2D.fit(template, smoothed)
+            rawAnchor = Affine2D.fit(template, pts)
+            info.rawJoints = pts
+            info.smoothedJoints = smoothed
+
+            if dorsal != true {
+                tracker.reset()
+                status = "Palm facing the camera — turn your hand over."
+            } else if let anchor {
+                if tracker.nodes == nil {
+                    tracker.start(anchor: anchor, placement: placement, sgn: sgn)
+                    disagreeing = 0
+                    opacity = 0 // (re)acquire: fade in on the intended spot, never snap into view
+                    confidence = 1
+                } else {
+                    tracker.update(anchor: anchor, placement: placement, sgn: sgn, before: before, now: pyramid,
+                                   options: options, dt: dt, isOffSkin: { _ in false })
+                    confidence = tracker.followingSkin || !settings.skinLock
+                        ? (settings.skinLock ? tracker.flowConfidence : 1) : Tracking.jointsOnlyConfidence
+                }
+                // Skin mesh and joints disagree badly: fade out, then re-acquire from the joints.
+                if let centre = tracker.point(s: 0, t: 0) {
+                    let wanted = anchor.apply(placement.templatePoint(s: 0, t: 0, sgn: sgn))
+                    disagreeing = simd_distance(centre, wanted) / handSize > Tracking.lostAt ? disagreeing + 1 : 0
+                    if disagreeing >= Tracking.lostFrames {
+                        confidence = 0
+                        if opacity < 0.05 {
+                            tracker.start(anchor: anchor, placement: placement, sgn: sgn)
+                            disagreeing = 0
                         }
-                    }
-                    guard poly.count >= 3 else { continue }
-                    for k in 1..<(poly.count - 1) {
-                        indices += [poly[0], poly[k], poly[k + 1], poly[0], poly[k + 1], poly[k]]
                     }
                 }
             }
+        } else if tracker.nodes != nil, time - lastSeen < Tracking.forgetAfter, dorsal == true, settings.skinLock {
+            // Vision missed the hand this frame: keep following the skin alone (fades if that fails too).
+            tracker.update(anchor: nil, placement: placement, sgn: sgn, before: before, now: pyramid,
+                           options: options, dt: dt, isOffSkin: { _ in false })
+            confidence = tracker.followingSkin ? tracker.flowConfidence : 0
+        } else {
+            if time - lastSeen > Tracking.forgetAfter { reset() }
+            status = "Show the back of your hand."
+            if opacity < 0.05 { tracker.reset() }
         }
-        return Result(positions: positions, uvs: uvs, indices: indices, tint: tint, status: "")
+
+        // Confidence → opacity. Partly tracked skin, or a surface turning edge-on, fades; nothing ever jumps.
+        let affine = tracker.affine(placement: placement, sgn: sgn)
+        let foreshortening = affine.map { WoundSession.axisRatio($0) } ?? 0
+        var target = ramp(0.15, 0.45, confidence) * ramp(Tracking.edgeOn.0, Tracking.edgeOn.1, foreshortening)
+        if tracker.nodes == nil { target = 0 }
+        opacity += max(min(target - opacity, Tracking.fadeIn * dt), -Tracking.fadeOut * dt)
+        if tracker.nodes == nil { opacity = 0 }
+
+        var mesh: (vertices: [WoundVertex], indices: [UInt16], capsules: [Capsule])?
+        if opacity > 0.001, tracker.nodes != nil {
+            mesh = buildMesh(image: image, depth: depth, size: size, woundJoints: woundJoints, hands: hands,
+                             picked: picked?.0, settings: settings, info: &info)
+        }
+        if settings.debug {
+            fillDebug(&info, sgn: sgn, anchor: anchor, rawAnchor: rawAnchor, affine: affine, confidence: confidence,
+                      foreshortening: foreshortening, handSize: handSize)
+        }
+        let frame = RenderFrame(image: image, vertices: mesh?.vertices ?? [], indices: mesh?.indices ?? [],
+                                opacity: mesh == nil ? 0 : opacity, referenceLuma: referenceLuma,
+                                capsules: mesh?.capsules ?? [])
+        return Output(frame: frame, status: status, debug: settings.debug ? info : nil)
     }
 
-    // Carries the template→image map from the previous frame to this one by tracking a grid of skin points
-    // (forward–backward checked), refits it robustly, and blends it toward the joints' map. nil = skin lost.
-    private func followSkin(_ previous: Affine2D, from before: LumaPyramid, to now: LumaPyramid, joints: Affine2D,
-                            sgn: Float, handSize: Float, centre: SIMD2<Float>) -> Affine2D? {
-        var src: [SIMD2<Float>] = [], dst: [SIMD2<Float>] = []
-        for g in Skin.grid {
-            let q = SIMD2(g.x * sgn, g.y)
-            let p = previous.apply(q) / 2 // pyramid level 0 is half resolution
-            guard let moved = SkinFlow.track(p, from: before, to: now),
-                  let back = SkinFlow.track(moved, from: now, to: before),
-                  simd_distance(back, p) < Skin.forwardBackwardMax else { continue }
-            src.append(q)
-            dst.append(moved * 2)
+    private func buildMesh(image: CVPixelBuffer, depth: CVPixelBuffer?, size: SIMD2<Float>,
+                           woundJoints: [SIMD2<Float>], hands: [VNHumanHandPoseObservation],
+                           picked: VNHumanHandPoseObservation?, settings: WoundSettings,
+                           info: inout DebugInfo) -> (vertices: [WoundVertex], indices: [UInt16], capsules: [Capsule])? {
+        var pixels: [SIMD2<Float>] = []
+        var uvs: [SIMD2<Float>] = []
+        pixels.reserveCapacity((segS + 1) * (segT + 1))
+        for j in 0...segT {
+            for i in 0...segS {
+                let s = Float(i) / Float(segS), t = Float(j) / Float(segT)
+                guard let p = tracker.point(s: s - 0.5, t: t - 0.5) else { return nil }
+                pixels.append(p)
+                uvs.append(SIMD2(s, t))
+            }
         }
-        guard src.count >= Skin.minPoints, let first = Affine2D.fit(src, dst) else { return nil }
-        var keptSrc: [SIMD2<Float>] = [], keptDst: [SIMD2<Float>] = []
-        for (q, p) in zip(src, dst) where simd_distance(first.apply(q), p) < Skin.residualMax {
-            keptSrc.append(q)
-            keptDst.append(p)
+
+        // Depth: what is in front of the skin (other hand, objects) and where the hand ends (background).
+        var visibility = [Float](repeating: 1, count: pixels.count)
+        var otherBehind = false
+        let other = otherHand(hands, picked: picked)
+        if let depth, settings.depthOcclusion || (settings.handOcclusion && other != nil) {
+            CVPixelBufferLockBaseAddress(depth, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(depth, .readOnly) }
+            if let base = CVPixelBufferGetBaseAddress(depth) {
+                let sampler = DepthSampler(base: UnsafeRawPointer(base), width: CVPixelBufferGetWidth(depth),
+                                           height: CVPixelBufferGetHeight(depth),
+                                           rowBytes: CVPixelBufferGetBytesPerRow(depth), imageSize: size)
+                let handDepths = (tracker.nodes ?? []).compactMap { sampler.depth(at: $0) }.sorted()
+                let handDepth: Float? = handDepths.isEmpty ? nil : handDepths[handDepths.count / 2]
+                if settings.depthOcclusion, let handDepth {
+                    let anchors = woundJoints.compactMap { p in sampler.depth(at: p).map { (p, $0) } }
+                    let samples = pixels.compactMap { p in sampler.depth(at: p).map { (p, $0) } }
+                    let skin = SkinSurface(samples: samples, anchors: anchors)
+                    for (k, p) in pixels.enumerated() {
+                        guard let m = sampler.depth(at: p) else { continue }
+                        let expected = skin?.depth(at: p) ?? handDepth
+                        let onHand = 1 - ramp(0.05, 0.08, m - handDepth) // background well behind: hand ended
+                        let inFront = ramp(0.015, 0.03, expected - m) // clearly in front (close-range LiDAR is noisy)
+                        visibility[k] = onHand * (1 - inFront)
+                    }
+                }
+                // The other hand clearly BEHIND the wound hand must not cover it.
+                if let handDepth, let other {
+                    let d = other.points.compactMap { sampler.depth(at: $0) }.sorted()
+                    if !d.isEmpty, d[d.count / 2] > handDepth + 0.03 { otherBehind = true }
+                }
+            }
         }
-        guard keptSrc.count >= Skin.minPoints, let skin = Affine2D.fit(keptSrc, keptDst) else { return nil }
-        let gap = simd_distance(skin.apply(centre), joints.apply(centre)) / handSize
-        return skin.blended(toward: joints, by: gap > Skin.lostAt ? Skin.snapAlpha : Skin.alpha)
+
+        // Surface turning away locally: drop triangles whose on-screen winding is opposite to the patch's.
+        // Triangles (a, c, b) and (b, c, d) both have negative area in (s, t); a patch with a positive (s, t) → image
+        // determinant keeps negative-area triangles, and vice versa.
+        let patch = tracker.stAffine().map { $0.x.x * $0.y.y - $0.x.y * $0.y.x } ?? 1
+        var indices: [UInt16] = []
+        indices.reserveCapacity(segS * segT * 6)
+        let row = segS + 1
+        for j in 0..<segT {
+            for i in 0..<segS {
+                let a = j * row + i, b = a + 1, c = a + row, d = c + 1
+                for tri in [(a, c, b), (b, c, d)] {
+                    let e1 = pixels[tri.1] - pixels[tri.0], e2 = pixels[tri.2] - pixels[tri.0]
+                    let area = e1.x * e2.y - e1.y * e2.x
+                    if area * patch >= 0 { continue }
+                    indices += [UInt16(tri.0), UInt16(tri.1), UInt16(tri.2)]
+                }
+            }
+        }
+
+        // Skin brightness around the wound: reference for the shading transfer in the shader.
+        if let luma = meanLuma(image, at: tracker.nodes ?? []) { referenceLuma += 0.2 * (luma - referenceLuma) }
+
+        let capsules = settings.handOcclusion && !otherBehind ? (other?.capsules ?? []) : []
+        info.capsules = capsules
+        info.outlineFinal = outline { s, t in self.tracker.point(s: s, t: t) }
+
+        var vertices: [WoundVertex] = []
+        vertices.reserveCapacity(pixels.count)
+        for k in 0..<pixels.count {
+            let p = pixels[k], uv = uvs[k]
+            vertices.append(WoundVertex(imageUV: SIMD4(p.x / size.x, p.y / size.y, uv.x, uv.y),
+                                        extra: SIMD4(visibility[k], 0, 0, 0)))
+        }
+        return (vertices, indices, capsules)
     }
 
-    // The hand to put the wound on: the one nearest to where it was last seen, so the other hand can't steal
-    // the wound when Vision gives both the same left/right label; the majority left/right breaks ties.
-    private func pickHand(_ hands: [VNHumanHandPoseObservation], _ resolution: SIMD2<Float>)
+    private struct OtherHand {
+        let points: [SIMD2<Float>]
+        let capsules: [Capsule]
+    }
+
+    // The non-wound hand as soft capsules (finger bones, palm), in camera-image pixels.
+    private func otherHand(_ hands: [VNHumanHandPoseObservation], picked: VNHumanHandPoseObservation?) -> OtherHand? {
+        guard let other = hands.first(where: { $0 !== picked }),
+              let all = try? other.recognizedPoints(.all) else { return nil }
+        let size = imageSize
+        func p(_ name: VNHumanHandPoseObservation.JointName) -> SIMD2<Float>? {
+            guard let r = all[name], r.confidence > 0.3 else { return nil }
+            return SIMD2(Float(r.location.x) * size.x, (1 - Float(r.location.y)) * size.y)
+        }
+        guard let index = p(.indexMCP), let little = p(.littleMCP) else { return nil }
+        let hs = max(simd_distance(index, little), 1)
+        let finger = 0.12 * hs, palm = 0.24 * hs, soft = max(0.04 * hs, 2)
+        let bones: [(VNHumanHandPoseObservation.JointName, VNHumanHandPoseObservation.JointName, Float)] = [
+            (.thumbCMC, .thumbMP, finger), (.thumbMP, .thumbIP, finger), (.thumbIP, .thumbTip, finger),
+            (.indexMCP, .indexPIP, finger), (.indexPIP, .indexDIP, finger), (.indexDIP, .indexTip, finger),
+            (.middleMCP, .middlePIP, finger), (.middlePIP, .middleDIP, finger), (.middleDIP, .middleTip, finger),
+            (.ringMCP, .ringPIP, finger), (.ringPIP, .ringDIP, finger), (.ringDIP, .ringTip, finger),
+            (.littleMCP, .littlePIP, finger), (.littlePIP, .littleDIP, finger), (.littleDIP, .littleTip, finger),
+            (.wrist, .indexMCP, palm), (.wrist, .middleMCP, palm), (.wrist, .ringMCP, palm), (.wrist, .littleMCP, palm),
+            (.indexMCP, .littleMCP, palm), (.wrist, .thumbCMC, palm), (.thumbCMC, .indexMCP, palm),
+        ]
+        var capsules: [Capsule] = []
+        var points: [SIMD2<Float>] = []
+        for (a, b, r) in bones {
+            guard let pa = p(a), let pb = p(b) else { continue }
+            capsules.append(Capsule(ends: SIMD4(pa.x, pa.y, pb.x, pb.y), params: SIMD4(r, soft, 0, 0)))
+            points.append(pa)
+        }
+        return capsules.isEmpty ? nil : OtherHand(points: points, capsules: capsules)
+    }
+
+    // The hand to put the wound on: nearest to where it was last seen (the other hand can't steal the wound when
+    // Vision gives both the same label); the majority left/right breaks ties; a far-away hand is ignored.
+    private func pickHand(_ hands: [VNHumanHandPoseObservation], _ size: SIMD2<Float>)
         -> (VNHumanHandPoseObservation, [SIMD2<Float>])? {
         var best: (VNHumanHandPoseObservation, [SIMD2<Float>])?
         var bestScore = Float.infinity
         for hand in hands {
-            guard let pts = jointPixels(hand, resolution) else { continue }
+            guard let pts = jointPixels(hand, size) else { continue }
             var score: Float = 0
             if let last = lastCentroid {
                 let c = pts.reduce(SIMD2<Float>()) { $0 + $1 } / Float(pts.count)
@@ -336,17 +424,15 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
                 bestScore = score
             }
         }
-        // While we still remember the hand, a hand far from it is the other one: treat as lost, don't jump.
         if lastCentroid != nil, bestScore > Tracking.maxJump { return nil }
         return best
     }
 
-    // Wrist + MCP image points in capturedImage pixels (Vision: normalized, origin bottom-left).
-    private func jointPixels(_ hand: VNHumanHandPoseObservation, _ resolution: SIMD2<Float>) -> [SIMD2<Float>]? {
+    private func jointPixels(_ hand: VNHumanHandPoseObservation, _ size: SIMD2<Float>) -> [SIMD2<Float>]? {
         var pts: [SIMD2<Float>] = []
         for name in joints {
             guard let p = try? hand.recognizedPoint(name), p.confidence > 0.3 else { return nil }
-            pts.append(SIMD2(Float(p.location.x) * resolution.x, (1 - Float(p.location.y)) * resolution.y))
+            pts.append(SIMD2(Float(p.location.x) * size.x, (1 - Float(p.location.y)) * size.y))
         }
         return pts
     }
@@ -354,34 +440,59 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
     private func reset() {
         filters.forEach { $0.reset() }
         leftVotes = 0
+        disagreeing = 0
         lastCentroid = nil
         dorsal = nil
-        mapping = nil
-        previousPyramid = nil
     }
 
-    // MARK: Rendering (main thread)
+    // MARK: Geometry helpers
 
-    private func apply(_ result: Result) {
-        if status != result.status { status = result.status }
-        guard let entity = woundEntity else { return }
-        guard let positions = result.positions, !result.indices.isEmpty else {
-            entity.isEnabled = false
-            return
+    // Minor/major axis ratio of an affine map's linear part: 1 = facing the camera, → 0 = edge-on.
+    private static func axisRatio(_ a: Affine2D) -> Float {
+        let m00 = a.x.x, m01 = a.x.y, m10 = a.y.x, m11 = a.y.y
+        let e = m00 * m00 + m01 * m01 + m10 * m10 + m11 * m11
+        let det = abs(m00 * m11 - m01 * m10)
+        let root = max(e * e - 4 * det * det, 0).squareRoot()
+        let major = ((e + root) / 2).squareRoot(), minor = (max(e - root, 0) / 2).squareRoot()
+        return major > 1e-6 ? minor / major : 0
+    }
+
+    private func outline(_ f: (Float, Float) -> SIMD2<Float>?) -> [SIMD2<Float>] {
+        var edge: [(Float, Float)] = []
+        for k in 0...8 { edge.append((Float(k) / 8 - 0.5, -0.5)) }
+        for k in 0...8 { edge.append((0.5, Float(k) / 8 - 0.5)) }
+        for k in 0...8 { edge.append((0.5 - Float(k) / 8, 0.5)) }
+        for k in 0...8 { edge.append((-0.5, 0.5 - Float(k) / 8)) }
+        return edge.compactMap { f($0.0, $0.1) }
+    }
+
+    private func fillDebug(_ info: inout DebugInfo, sgn: Float, anchor: Affine2D?, rawAnchor: Affine2D?,
+                           affine: Affine2D?, confidence: Float, foreshortening: Float, handSize: Float) {
+        let place = placement
+        info.nodes = tracker.nodes ?? []
+        info.nodeTrust = tracker.weights
+        if let rawAnchor { info.outlineRaw = outline { s, t in rawAnchor.apply(place.templatePoint(s: s, t: t, sgn: sgn)) } }
+        if let anchor { info.outlineAnchor = outline { s, t in anchor.apply(place.templatePoint(s: s, t: t, sgn: sgn)) } }
+        if info.outlineFinal.isEmpty { info.outlineFinal = outline { s, t in self.tracker.point(s: s, t: t) } }
+        if let a = affine {
+            let centre = place.templatePoint(s: 0, t: 0, sgn: sgn)
+            let origin = a.apply(centre)
+            info.axisOrigin = origin
+            info.axisU = a.apply(centre + SIMD2(0.3 * sgn, 0)) - origin
+            info.axisV = a.apply(centre + SIMD2(0, 0.3)) - origin
+            // Weak-perspective normal: tilt = acos(minor/major), leaning along the more compressed axis.
+            let u = info.axisU, v = info.axisV
+            let compressed = simd_length(u) < simd_length(v) ? u : v
+            let tilt = acos(min(max(foreshortening, 0), 1))
+            if simd_length(compressed) > 1e-3 {
+                info.normal = simd_normalize(compressed) * sin(tilt) * 0.3 * handSize
+            }
         }
-        var descriptor = MeshDescriptor(name: "wound")
-        descriptor.positions = MeshBuffers.Positions(positions)
-        descriptor.textureCoordinates = MeshBuffers.TextureCoordinates(result.uvs)
-        descriptor.primitives = .triangles(result.indices)
-        if let mesh = try? MeshResource.generate(from: [descriptor]) {
-            entity.model?.mesh = mesh
-            entity.isEnabled = true
-        }
-        if abs(result.tint - appliedTint) > 0.01 {
-            appliedTint = result.tint
-            let k = CGFloat(result.tint)
-            material.color.tint = UIColor(red: k, green: k, blue: k, alpha: 0.999)
-            entity.model?.materials = [material]
-        }
+        let mode = tracker.nodes == nil ? "lost" : (tracker.followingSkin ? "skin" : "joints")
+        info.lines = [
+            String(format: "mode %@  skin tracked %.0f%%", mode, tracker.flowConfidence * 100),
+            String(format: "confidence %.2f  facing %.2f  opacity %.2f", confidence, foreshortening, opacity),
+            String(format: "hand %.0f px  %@ hand", handSize, sgn > 0 ? "left" : "right"),
+        ]
     }
 }

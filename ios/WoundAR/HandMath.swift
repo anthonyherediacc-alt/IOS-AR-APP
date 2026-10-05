@@ -64,6 +64,13 @@ struct Affine2D {
         Affine2D(x: x + a * (other.x - x), y: y + a * (other.y - y))
     }
 
+    func inverted() -> Affine2D? {
+        let det = x.x * y.y - x.y * y.x
+        guard abs(det) > 1e-9 else { return nil }
+        let ia = y.y / det, ib = -x.y / det, ic = -y.x / det, id = x.x / det
+        return Affine2D(x: SIMD3(ia, ib, -(ia * x.z + ib * y.z)), y: SIMD3(ic, id, -(ic * x.z + id * y.z)))
+    }
+
     // Least squares through point pairs (needs ≥ 3 non-collinear points).
     static func fit(_ src: [SIMD2<Float>], _ dst: [SIMD2<Float>]) -> Affine2D? {
         guard src.count >= 3, src.count == dst.count else { return nil }
