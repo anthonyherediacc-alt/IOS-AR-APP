@@ -1,6 +1,6 @@
 # AR Wound Sim (Safari prototype)
 
-Camera-based pseudo-AR: MediaPipe Hand Landmarker tracks a hand in the browser and a PNG wound is drawn over it with Canvas 2D. Static site, no build step, no backend.
+Camera-based pseudo-AR: MediaPipe Hand Landmarker tracks a hand in the browser and a PNG wound is drawn on the back of the hand as a lit 3D surface with Three.js. Static site, no build step, no backend.
 
 ## Run
 Must be served over HTTPS for camera access (or `http://localhost` on desktop).
