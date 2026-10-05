@@ -23,73 +23,115 @@ export async function createHandLandmarker() {
   }
 }
 
-const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-const cross = (a, b, o) => {
-  const x = a[1] * b[2] - a[2] * b[1], y = a[2] * b[0] - a[0] * b[2], z = a[0] * b[1] - a[1] * b[0];
-  o[0] = x; o[1] = y; o[2] = z; return o;
-};
 const normalize = (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; a[0] /= l; a[1] /= l; a[2] /= l; return a; };
-const L = [0, 0, 0], F = [0, 0, 0], X = [0, 0, 0], Y = [0, 0, 0], N = [0, 0, 0];
 
-// Dorsal (back-of-hand) frame from the 21 normalized landmarks. Writes into `out`:
-//   a..f      canvas affine (ctx.setTransform order) mapping hand-local (u, v) to video pixels.
-//             Units are hand widths (index MCP ↔ pinky MCP); origin = palm centroid (wrist + 4 MCPs);
-//             +u = right as seen looking at the back of the hand, +v = toward the fingers.
-//   facing    cos(angle between dorsal normal and direction to camera): 1 = back faces camera, -1 = palm.
-//   indexSide +1/-1: whether +u points toward the index finger (flips with handedness).
-//   nx, ny    dorsal normal's image-plane components (debug).
-// Uses normalized landmarks as 3D points (x·w, y·h, z·w): MediaPipe's z is relative depth on roughly
-// the same scale as x, so these are camera-aligned pixels. worldLandmarks were tested and rejected:
-// they are not camera-aligned and squash palm width on dorsal views (width/length 0.41 vs 0.75).
-export function getHandFrame(lm, isRight, w, h, out) {
-  const p0 = lm[WRIST], p5 = lm[INDEX_MCP], p17 = lm[PINKY_MCP];
-  L[0] = (p5.x - p17.x) * w; L[1] = (p5.y - p17.y) * h; L[2] = (p5.z - p17.z) * w; // lateral, toward index
-  // Longitudinal: wrist → mean of the 4 MCPs (steadier than wrist → middle MCP alone).
-  let cx = 0, cy = 0, cz = 0;
-  for (let i = 1; i < PALM.length; i++) { cx += lm[PALM[i]].x; cy += lm[PALM[i]].y; cz += lm[PALM[i]].z; }
-  const k = PALM.length - 1;
-  F[0] = (cx / k - p0.x) * w; F[1] = (cy / k - p0.y) * h; F[2] = (cz / k - p0.z) * w;
-  const width = Math.hypot(L[0], L[1], L[2]);
-  if (!width) return false;
+// Canonical dorsal patch: wrist + index/middle/ring/pinky MCPs in hand-local units (hand widths,
+// index MCP ↔ pinky MCP = 1), centroid at the origin, +u toward the index finger, +v toward the
+// fingers. Averaged from MediaPipe landmarks of flat open hands in sample photos (±0.01). These five
+// points sit on the rigid metacarpal block, so finger movement barely affects the fit.
+export const TEMPLATE = [[0, -0.995], [0.51, 0.334], [0.135, 0.337], [-0.187, 0.238], [-0.458, 0.086]];
+let TUU = 0, TUV = 0, TVV = 0;
+for (const [u, v] of TEMPLATE) { TUU += u * u; TUV += u * v; TVV += v * v; }
+const TDET = TUU * TVV - TUV * TUV;
 
-  // Image axes: x right, y down, z away from camera (right-handed). L × F points out of the PALM for
-  // a right hand and out of the BACK for a left hand (mirror images), so flip it for right hands.
-  // Verified against MediaPipe test photos (both chiralities, palm and dorsal, plus mirrored copies).
-  // MediaPipe's handedness is correct for un-mirrored frames, which is what getUserMedia delivers.
-  normalize(cross(L, F, N));
-  if (isRight) { N[0] = -N[0]; N[1] = -N[1]; N[2] = -N[2]; }
-  normalize(cross(N, L, Y)); // re-orthogonalize: in-plane, ⟂ L
-  if (dot(Y, F) < 0) { Y[0] = -Y[0]; Y[1] = -Y[1]; Y[2] = -Y[2]; } // toward fingers
-  cross(Y, N, X);               // right-handed (X, Y, N): +X is "right" when viewing the back of the hand
-  out.indexSide = dot(X, L) > 0 ? 1 : -1;
-  out.facing = -N[2]; // camera is toward -z. Sign depends only on 2D geometry + handedness; z sets magnitude.
-  out.nx = N[0]; out.ny = N[1];
+export const createPose = () => ({ o: [0, 0, 0], x: [1, 0, 0], y: [0, 1, 0], n: [0, 0, 1], indexSide: 1, facing: 0, valid: false, t: 0, speed: 0, vel: new Float64Array(7) });
 
-  // Weak perspective (hand small vs. camera distance): a local unit vector projects to its x/y × width.
-  out.a = X[0] * width; out.b = X[1] * width;
-  out.c = Y[0] * width; out.d = Y[1] * width;
-  out.e = (p0.x + cx) / PALM.length * w; out.f = (p0.y + cy) / PALM.length * h;
+// Dorsal-hand pose in a pinhole camera frame (x right, y down, z away; units = hand widths):
+//   o = patch origin (centroid of wrist + 4 MCPs), x = right as seen looking at the back of the hand,
+//   y = toward the fingers, n = x × y = dorsal normal (out of the back of the hand).
+// cam = { f, cx, cy } in video pixels.
+export function getHandPose(lm, isRight, w, h, cam, out) {
+  // The template is a left hand; a right hand is its mirror image, so flip u. MediaPipe handedness
+  // is correct for un-mirrored frames (what getUserMedia delivers) — verified on sample photos.
+  const sgn = isRight ? -1 : 1;
+  let tx = 0, ty = 0, zm = 0;
+  for (const i of PALM) { tx += lm[i].x * w; ty += lm[i].y * h; zm += lm[i].z; }
+  tx /= PALM.length; ty /= PALM.length; zm /= PALM.length;
+
+  // Least-squares affine template → image over all 5 points: A = (Σ p qᵀ)(Σ q qᵀ)⁻¹. This is the
+  // weak-perspective projection of the patch; using every point averages out per-landmark noise.
+  let xu = 0, xv = 0, yu = 0, yv = 0;
+  for (let k = 0; k < PALM.length; k++) {
+    const u = sgn * TEMPLATE[k][0], v = TEMPLATE[k][1], px = lm[PALM[k]].x * w - tx, py = lm[PALM[k]].y * h - ty;
+    xu += px * u; xv += px * v; yu += py * u; yv += py * v;
+  }
+  const tuv = sgn * TUV;
+  const a = (xu * TVV - xv * tuv) / TDET, c = (xv * TUU - xu * tuv) / TDET;
+  const b = (yu * TVV - yv * tuv) / TDET, d = (yv * TUU - yu * tuv) / TDET;
+
+  // A = s·[x.xy  y.xy]. Scale s (px per hand width) = A's largest singular value: the un-foreshortened
+  // direction, so it doesn't change with tilt and needs no depth estimate.
+  const p2 = a * a + b * b, q2 = c * c + d * d, r = a * c + b * d;
+  const s = Math.sqrt((p2 + q2) / 2 + Math.sqrt(((p2 - q2) / 2) ** 2 + r * r));
+  if (!(s > 0)) return false;
+  // Out-of-plane parts: least-squares z-gradient of MediaPipe's relative depth over the same points.
+  // Deriving them from foreshortening instead turns small template/hand proportion differences into
+  // fake 10–15° tilts with a noisy sign (tested), so z is used here — it only affects perspective.
+  let zu = 0, zv = 0;
+  for (let k = 0; k < PALM.length; k++) {
+    const dz = (lm[PALM[k]].z - zm) * w; // MediaPipe z is on roughly the same scale as x
+    zu += dz * sgn * TEMPLATE[k][0]; zv += dz * TEMPLATE[k][1];
+  }
+  // Axes are kept exactly as fitted (not re-normalized) so the projection at the origin reproduces the
+  // observed 2D affine: the wound matches what the camera sees even if the z estimate is off.
+  out.x[0] = a / s; out.x[1] = b / s; out.x[2] = (zu * TVV - zv * tuv) / TDET / s;
+  out.y[0] = c / s; out.y[1] = d / s; out.y[2] = (zv * TUU - zu * tuv) / TDET / s;
+  // Pinhole back-projection of the patch centroid at depth f/s (hand widths).
+  out.o[0] = (tx - cam.cx) / s; out.o[1] = (ty - cam.cy) / s; out.o[2] = cam.f / s;
+  out.indexSide = sgn;
+  finishPose(out);
   return true;
 }
 
-// One Euro filter (Casiez et al., CHI 2012) on each pose value: a low-pass whose cutoff rises with
-// speed, so jitter is suppressed when still and lag stays low when moving. Smoothing the affine
-// entries directly avoids angle wrap-around. State fields mirror the pose; state.dx holds derivatives.
-const POSE_KEYS = ["a", "b", "c", "d", "e", "f", "facing"];
+// Dorsal normal n = x × y (debug), and facing = cos(tilt from the camera) from 2D foreshortening:
+// det/σ₁² of the on-screen axes = ±σ₂/σ₁. Sign: +v maps to screen-up when the back faces the camera
+// (det < 0). 1 = back of hand faces camera, −1 = palm. No depth estimate needed.
+function finishPose(p) {
+  const x = p.x, y = p.y, n = p.n;
+  n[0] = x[1] * y[2] - x[2] * y[1]; n[1] = x[2] * y[0] - x[0] * y[2]; n[2] = x[0] * y[1] - x[1] * y[0];
+  normalize(n);
+  const p2 = x[0] * x[0] + x[1] * x[1], q2 = y[0] * y[0] + y[1] * y[1], r = x[0] * y[0] + x[1] * y[1];
+  p.facing = -(x[0] * y[1] - x[1] * y[0]) / ((p2 + q2) / 2 + Math.sqrt(((p2 - q2) / 2) ** 2 + r * r));
+}
+
+// One Euro filter (Casiez et al., CHI 2012) on the whole frame with ONE shared cutoff, driven by how
+// fast the patch moves on screen (hand widths/s: translation + depth change + rotation). A shared
+// cutoff keeps origin, axes and scale coherent, so the wound can't swim or stretch against the skin.
+// Still hand → low cutoff (steady); moving hand → high cutoff (little lag).
 const lowpassAlpha = (cutoff, dt) => 1 / (1 + 1 / (2 * Math.PI * cutoff * dt));
-export function smoothTransform(s, target, cfg, tMs) {
+export function smoothPose(s, raw, cfg, tMs) {
   const dt = (tMs - s.t) / 1000;
   s.t = tMs;
+  s.indexSide = raw.indexSide;
   if (!s.valid || !(dt > 0) || dt > 0.5) {
-    for (const k of POSE_KEYS) { s[k] = target[k]; s.dx[k] = 0; }
-    s.valid = true;
+    for (let j = 0; j < 3; j++) { s.o[j] = raw.o[j]; s.x[j] = raw.x[j]; s.y[j] = raw.y[j]; }
+    s.vel.fill(0); s.speed = 0; s.valid = true;
+    finishPose(s);
     return;
   }
-  const ad = lowpassAlpha(cfg.dCutoff, dt);
-  for (const k of POSE_KEYS) {
-    s.dx[k] += ad * ((target[k] - s[k]) / dt - s.dx[k]);
-    s[k] += lowpassAlpha(cfg.minCutoff + cfg.beta * Math.abs(s.dx[k]), dt) * (target[k] - s[k]);
+  // Signed velocity of the on-screen patch, low-passed per component BEFORE taking its magnitude (as in
+  // the original filter) so landmark noise averages out instead of inflating the speed. Weights convert
+  // depth change and axis rotation to hand widths of on-screen motion (0.5 ≈ patch radius).
+  const ad = lowpassAlpha(cfg.dCutoff, dt), v = s.vel;
+  v[0] += ad * ((raw.o[0] - s.o[0]) / dt - v[0]);
+  v[1] += ad * ((raw.o[1] - s.o[1]) / dt - v[1]);
+  v[2] += ad * ((0.5 * (raw.o[2] / s.o[2] - 1)) / dt - v[2]);
+  for (let j = 0; j < 2; j++) {
+    v[3 + j] += ad * ((0.5 * (raw.x[j] - s.x[j])) / dt - v[3 + j]);
+    v[5 + j] += ad * ((0.5 * (raw.y[j] - s.y[j])) / dt - v[5 + j]);
   }
+  s.speed = Math.hypot(v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+  const al = lowpassAlpha(cfg.minCutoff + cfg.beta * s.speed, dt);
+  for (let j = 0; j < 3; j++) {
+    s.o[j] += al * (raw.o[j] - s.o[j]); s.x[j] += al * (raw.x[j] - s.x[j]); s.y[j] += al * (raw.y[j] - s.y[j]);
+  }
+  finishPose(s);
+}
+
+// Hand-local (u, v) in hand widths → video pixels (out[k], out[k+1]) and camera depth (out[k+2]).
+export function projectLocal(p, cam, u, v, out, k) {
+  const X = p.o[0] + u * p.x[0] + v * p.y[0], Y = p.o[1] + u * p.x[1] + v * p.y[1], Z = p.o[2] + u * p.x[2] + v * p.y[2];
+  out[k] = cam.cx + (cam.f * X) / Z; out[k + 1] = cam.cy + (cam.f * Y) / Z; out[k + 2] = Z;
 }
 
 // Wound alpha from how much the back of the hand faces the camera. Hysteresis between

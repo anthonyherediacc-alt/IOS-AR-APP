@@ -9,6 +9,8 @@
 <body>
   <!-- playsinline + muted are required for inline autoplay in iOS Safari -->
   <video id="video" playsinline muted autoplay></video>
+  <!-- WebGL view draws the tracked camera frame + wound together; overlay is debug only -->
+  <canvas id="view"></canvas>
   <canvas id="overlay"></canvas>
   <div id="status">Tap Start to begin.</div>
   <button id="start">Start Camera</button>

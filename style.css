@@ -1,6 +1,6 @@
 html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 15px -apple-system, system-ui, sans-serif; overflow: hidden; }
-/* Video and canvas must share identical sizing/fit so overlay pixels line up. */
-#video, #overlay { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+/* Video and canvases must share identical sizing/fit so overlay pixels line up. */
+#video, #view, #overlay { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 #overlay { pointer-events: none; }
 #status { position: fixed; left: 16px; right: 16px; top: 40%; text-align: center; padding: 12px; background: rgba(0,0,0,.6); border-radius: 8px; }
 #status[hidden] { display: none; }

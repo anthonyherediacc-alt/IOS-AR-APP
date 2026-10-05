@@ -35,10 +35,12 @@ export const SETTINGS = {
 };
 
 export const TRACKING = {
-  // One Euro filter. Lower minCutoff = steadier when still; higher beta = less lag when moving.
-  minCutoff: 1.2, // Hz
-  beta: 0.004,
-  dCutoff: 1.0, // Hz
+  // One Euro filter on the whole hand frame. Speeds are in hand widths per second.
+  minCutoff: 1.0, // Hz when still: lower = steadier
+  beta: 12, // cutoff increase per hand-width/s: higher = less lag when moving
+  dCutoff: 3.0, // Hz, smoothing of the speed estimate (higher = reacts faster when motion starts)
+  focalLength: 0.75, // camera focal length ÷ video long side (iPhone main camera ≈ 0.75)
+  frameSync: true, // track and display the same captured frame (overlay can't lag the video)
   // facing = cos(angle between back-of-hand normal and camera direction); 1 = back faces camera.
   showFacing: 0.3, // wound appears above this...
   hideFacing: 0.15, // ...and disappears below this (hysteresis)
@@ -46,6 +48,11 @@ export const TRACKING = {
   dorsalFacing: 0.8, // debug labels only
   edgeOnFacing: 0.15,
   handednessMinScore: 0.8, // lock left/right once seen with this confidence (reset when hand is lost)
+};
+
+export const RENDER = {
+  skinBlend: 0.5, // 0 = paint over the skin, 1 = multiply into it (inherits skin shading/texture)
+  feather: 1.5, // softens only the PNG's own transparent edge (mip-level bias); 0 = off
 };
 
 const MP_VERSION = "1.0.1";
