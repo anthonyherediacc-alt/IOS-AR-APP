@@ -9,3 +9,4 @@
 - **svd-js** (`js/vendor/svd.js`) — Copyright 2017 Danilo Salvati. MIT; license text is in the file header.
 - **Three.js** r170 — Copyright 2010-2024 Three.js Authors. MIT (https://github.com/mrdoob/three.js/blob/dev/LICENSE). Loaded from a CDN.
 - **thin-plate-spline** (`js/vendor/thin-plate-spline.js`) — Copyright 2026 pravoobi. MIT; license text is in the file header.
+- Native app (`ios/WoundAR/HandMath.swift`) contains Swift ports of the OneEuroFilter (BSD-3-Clause, Inria / Géry Casiez) and thin-plate-spline (MIT, pravoobi) algorithms listed above.

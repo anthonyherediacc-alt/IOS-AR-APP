@@ -59,5 +59,15 @@ Frame-synced compositing, ported MediaPipe Procrustes pose, landmark 1€ smooth
 - Focal length is an assumed constant (0.75 × long side); only affects the small perspective term.
 - Rigid pose relies on MediaPipe z for yaw/pitch; synthetic yaw shows up to 13 % width error (unverified on a real hand).
 
+## Native iPhone app (ios/) — LiDAR
+Safari on iPhone has no WebXR AR and no LiDAR access (2026), so depth needs a native app.
+SwiftUI + ARKit (`smoothedSceneDepth`, `personSegmentationWithDepth`) + RealityKit + Vision hand pose.
+Pipeline: Vision 21 joints → 1€ (Swift port) on wrist/MCP image points → thin-plate spline (Swift port)
+hand canonical layout → image → LiDAR depth per wound-grid vertex (real skin, 3 mm lift) → unproject with
+intrinsics → world mesh (UnlitMaterial, texture alpha). Back/palm: same 2D cross + chirality rule.
+Build: XcodeGen `ios/project.yml` + `.github/workflows/ios.yml` on `macos-15` → unsigned `WoundAR.ipa`
+artifact → sideload from Windows with Sideloadly (free Apple ID = 7-day signing). See `ios/README.md`.
+Unverified on device: Vision chirality convention, UV orientation, texture alpha, depth/occlusion interplay.
+
 ## Next task
 Real-iPhone test of surface lock + Adjust panel; then occlusion (if needed). Panel settings/picture are not saved across reloads.
