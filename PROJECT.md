@@ -62,9 +62,11 @@ Frame-synced compositing, ported MediaPipe Procrustes pose, landmark 1€ smooth
 ## Native iPhone app (ios/) — LiDAR
 Safari on iPhone has no WebXR AR and no LiDAR access (2026), so depth needs a native app.
 SwiftUI + ARKit (`smoothedSceneDepth`, `personSegmentationWithDepth`) + RealityKit + Vision hand pose. (`personSegmentationWithDepth` removed — see device test.)
-Pipeline: Vision 21 joints → 1€ (Swift port) on wrist/MCP image points → thin-plate spline (Swift port)
-hand canonical layout → image → LiDAR depth per wound-grid vertex (real skin, 3 mm lift) → unproject with
-intrinsics → world mesh (UnlitMaterial, texture alpha). Back/palm: same 2D cross + chirality rule.
+Pipeline (current): Vision 21 joints → wrist/MCP depth from a robust skin surface fitted to the LiDAR over the back of
+the hand → joints in world space → 1€ (Swift port) per world coordinate → rigid hand frame (Gram–Schmidt on wrist/MCPs,
+same construction on the template) with hand size frozen after 15 frames → wound grid = fixed hand-frame points →
+projected into the image → LiDAR skin surface under the wound → unproject → world mesh (UnlitMaterial, texture alpha).
+Back/palm: same 2D cross + chirality rule, normalized, with hysteresis. (First version: 2D 1€ + thin-plate spline.)
 Build: XcodeGen `ios/project.yml` + `.github/workflows/ios.yml` on `macos-15` → unsigned `WoundAR.ipa`
 artifact → sideload from Windows with Sideloadly (free Apple ID = 7-day signing). See `ios/README.md`.
 Device test 1 (iPhone, iOS 27): app runs, wound lands on the back of the hand and follows it; chirality/dorsal rule correct.
@@ -79,6 +81,15 @@ depth → plane within 6 cm → quadratic within 2 cm → within 1 cm), every ve
 vertex (measured >1.2 cm in front = other hand, >2 cm behind = past the hand's edge), clamped to ±5 mm, and grid triangles clipped
 at its zero line (Sutherland–Hodgman, interpolated edge vertices → smooth cut-outs instead of grid steps); grid 16→24; wound tint =
 camera luma under the visible wound ÷ 0.55, clamped 0.25–1, smoothed. Textbook algorithms, own code (no new third-party code).
+User feedback after test 2: "no permanence — the wound moves to different spots constantly". Causes: 1€ on 2D image
+points (phone sway = apparent hand motion → lag → wound slides; can't smooth hard), per-frame TPS through 5 noisy joints
+(wound shifts and changes size with every joint error), hand picked by Vision's left/right label only (the other hand can
+take the wound), reset on any 1-frame tracking drop. Fix: world-space smoothing + rigid frame + frozen size (above); hand
+picked by nearest-to-last (label as tiebreak, >2 hand widths away = other hand → ignored); identity/size kept through
+drops < 0.7 s. Simulation (scratch harness: known hand + phone sway + Vision-like noise with slow bias, 8 s @ 30 fps),
+wound-centre wander mean/max mm, old → new (1€ 0.3/60/1): still hand 2.7/4.1 → 0.6/1.5; still hand + phone sway
+3.1/5.1 → 0.6/1.3; moving hand 2.3/4.9 → 1.5/3.1; both 2.7/6.4 → 2.0/3.5. At 3× noise the slow joint bias dominates
+(still 3.5/8.5 → 1.9/5.1): next step for true skin lock = image registration/optical flow on the skin, fused with joints.
 Still open: wound is computed from the frame Vision just finished (≈1 frame behind the live camera when the hand moves);
 no motion blur; brightness is one value for the whole wound (no shading gradient across it).
 

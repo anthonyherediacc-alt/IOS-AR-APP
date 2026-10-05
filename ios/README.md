@@ -15,12 +15,14 @@ Needs an iPhone **Pro** (12 Pro or newer, has LiDAR) and iOS 17+.
 5. With a free Apple ID the app stops opening after 7 days — repeat step 3 to refresh it.
 
 ## How it works
-Vision hand pose (21 joints + left/right) → 1€-smoothed wrist/knuckle points → thin-plate spline from the
-hand canonical layout to those points → each wound-grid vertex (24×24) gets an image position → one smooth
+Vision hand pose (21 joints + left/right) → wrist/knuckle points lifted to 3D with the LiDAR (skin surface
+fitted over the back of the hand) → 1€-smoothed in world space (the phone's own motion doesn't count as hand
+motion) → rigid hand frame with the hand's size measured once, then frozen → each wound-grid vertex (24×24) is
+a fixed spot of that frame, projected into the image → one smooth
 curved skin surface fitted to the LiDAR depth there (least squares, outliers rejected) → unprojected to world
 space with the camera intrinsics → RealityKit mesh, clipped smoothly where the LiDAR sees something in front of
 the skin or background behind it, tinted by the camera brightness under the wound.
 Back vs palm uses the same 2D-cross-product + handedness rule as the web app.
 
-Code: `WoundAR/WoundSession.swift` (pipeline), `WoundAR/HandMath.swift` (ported 1€ filter and thin-plate
-spline, skin-surface fit, depth/brightness sampling), `project.yml` (XcodeGen; the Xcode project is generated in CI).
+Code: `WoundAR/WoundSession.swift` (pipeline), `WoundAR/HandMath.swift` (ported 1€ filter and linear solver,
+hand frame, skin-surface fit, depth/brightness sampling), `project.yml` (XcodeGen; the Xcode project is generated in CI).

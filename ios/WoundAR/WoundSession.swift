@@ -25,14 +25,25 @@ private enum Wound {
     static let tintRange: ClosedRange<Float> = 0.25...1
 }
 
+// How the tracked joints become one fixed spot on the hand.
+private enum Tracking {
+    // 1€ filter on the joints' WORLD positions (metres): ARKit already removes the phone's own motion, so a
+    // still hand is still here and can be smoothed heavily; the cutoff rises when the hand really moves.
+    static let minCutoff = 0.3, beta = 60.0, dCutoff = 1.0
+    static let scaleFrames = 15 // hand size (metres) is measured over this many frames, then frozen
+    static let forgetAfter: TimeInterval = 0.7 // keep the hand's identity and size through brief tracking drops
+    static let maxJump: Float = 2 // a hand this many hand widths from the last one is a different hand
+    static let facingHysteresis: Float = 0.15 // back/palm only flips once clearly past edge-on
+}
+
 private let segments = 24 // wound grid resolution per side (also the resolution of occlusion edges)
 private let joints: [VNHumanHandPoseObservation.JointName] = [.wrist, .indexMCP, .middleMCP, .ringMCP, .littleMCP]
 
 // ARKit + Vision + LiDAR pipeline:
-//   camera frame → Vision hand pose (21 joints, chirality) → 1€-smoothed wrist/MCP image points →
-//   thin-plate spline from the hand canonical layout to those points → every wound-grid vertex gets an
-//   image position → one smooth skin surface fitted robustly to the LiDAR depth under the wound → unproject
-//   to world space. Occlusion also comes from the LiDAR depth: grid cells where something is in front of the
+//   camera frame → Vision hand pose (21 joints, chirality) → wrist/MCP depth from a skin surface fitted to the
+//   LiDAR over the back of the hand → joints in world space, 1€-smoothed there → rigid hand frame with a frozen
+//   hand size → each wound-grid vertex is a fixed point of that frame, projected into the image → one smooth
+//   skin surface fitted robustly to the LiDAR depth under the wound → unproject to world space. Occlusion also comes from the LiDAR depth: grid cells where something is in front of the
 //   skin, or where the hand ends, are dropped. The wound is tinted to the skin's measured brightness.
 // (ARKit people occlusion was tried first: its ML depth for the wound hand itself kept landing in front of
 // the LiDAR skin surface, so the hand hid its own wound — visible flicker in the first device test.)
@@ -50,10 +61,19 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
     private var woundEntity: ModelEntity?
     private var aspect: Float = 1
     private var material = UnlitMaterial()
-    private var tint: Float = 1 // smoothed brightness factor (vision queue)
     private var appliedTint: Float = 1 // tint currently on the material (main)
-    private let filters = (0..<10).map { _ in OneEuroFilter(minCutoff: 0.1, beta: 10, dCutoff: 2) }
+
+    // Tracking state (vision queue).
+    private var tint: Float = 1 // smoothed brightness factor
+    private let filters = (0..<15).map { _ in
+        OneEuroFilter(minCutoff: Tracking.minCutoff, beta: Tracking.beta, dCutoff: Tracking.dCutoff)
+    }
     private var lockedLeft: Bool?
+    private var lastCentroid: SIMD2<Float>?
+    private var lastHandSize: Float = 1
+    private var lastSeen: TimeInterval = 0
+    private var dorsal: Bool?
+    private var scaleSamples: [Float] = []
 
     func attach(to view: ARView) {
         let config = ARWorldTrackingConfiguration()
@@ -121,46 +141,27 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
                               cameraTransform: simd_float4x4, resolution: SIMD2<Float>, time: TimeInterval) -> Result {
         // Raw sensor orientation (.up): Vision points then match capturedImage and the depth map directly.
         try? VNImageRequestHandler(cvPixelBuffer: image, orientation: .up).perform([handRequest])
-        let hands = handRequest.results ?? []
-        guard let hand = pickHand(hands) else {
-            reset()
+        guard let picked = pickHand(handRequest.results ?? [], resolution) else {
+            if time - lastSeen > Tracking.forgetAfter { reset() }
             return Result(positions: nil, status: "Show the back of your hand.")
         }
-        let isLeft = hand.chirality == .left
-        if lockedLeft == nil, hand.chirality != .unknown { lockedLeft = isLeft }
-
-        // Joint image points in capturedImage pixels (Vision: normalized, origin bottom-left), 1€-smoothed
-        // with the speed term scaled by hand size (as in the web app / MediaPipe's smoothing calculator).
-        var pts: [SIMD2<Float>] = []
-        for name in joints {
-            guard let p = try? hand.recognizedPoint(name), p.confidence > 0.3 else {
-                return Result(positions: nil, status: "Show the back of your hand.")
-            }
-            pts.append(SIMD2(Float(p.location.x) * resolution.x, (1 - Float(p.location.y)) * resolution.y))
-        }
-        let handSize = Double(max(simd_distance(pts[1], pts[4]), 1))
-        for k in 0..<pts.count {
-            filters[2 * k].beta = 10 / handSize
-            filters[2 * k + 1].beta = 10 / handSize
-            pts[k] = SIMD2(Float(filters[2 * k].filter(Double(pts[k].x), time: time)),
-                           Float(filters[2 * k + 1].filter(Double(pts[k].y), time: time)))
-        }
+        let (hand, pts) = picked
+        lastSeen = time
+        lastCentroid = pts.reduce(SIMD2<Float>()) { $0 + $1 } / Float(pts.count)
+        lastHandSize = max(simd_distance(pts[1], pts[4]), 1)
+        if lockedLeft == nil, hand.chirality != .unknown { lockedLeft = hand.chirality == .left }
+        let side = lockedLeft ?? (hand.chirality == .left)
 
         // Back vs palm: a 2D cross product flips sign between the two sides; chirality tells which is which
-        // (same rule as the web app, which was verified on sample photos). Image y points down.
-        let side = lockedLeft ?? isLeft
+        // (same rule as the web app, confirmed on device). Image y points down. Normalized (sine of the angle)
+        // so the hysteresis band means the same at any distance.
         let lateral = pts[1] - pts[4]
         let forward = (pts[1] + pts[2] + pts[3] + pts[4]) / 4 - pts[0]
-        let cross = lateral.x * forward.y - lateral.y * forward.x
-        let dorsal = side ? cross < 0 : cross > 0
-        guard dorsal else {
+        let cross = (lateral.x * forward.y - lateral.y * forward.x) / max(simd_length(lateral) * simd_length(forward), 1)
+        let score = side ? -cross : cross // > 0: back of the hand toward the camera
+        if dorsal == nil || abs(score) > Tracking.facingHysteresis { dorsal = score > 0 }
+        guard dorsal == true else {
             return Result(positions: nil, status: "Palm facing the camera — turn your hand over.")
-        }
-
-        // Hand-local layout → image: thin-plate spline through the 5 joints. Right hands are mirror images.
-        let sgn: Float = side ? 1 : -1
-        guard let tps = ThinPlateSpline(src: handTemplate.map { SIMD2($0.x * sgn, $0.y) }, dst: pts) else {
-            return Result(positions: nil, status: "Tracking…")
         }
 
         CVPixelBufferLockBaseAddress(depth, .readOnly)
@@ -170,25 +171,76 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
                                    height: CVPixelBufferGetHeight(depth), rowBytes: CVPixelBufferGetBytesPerRow(depth),
                                    imageSize: resolution)
         let fx = intrinsics[0][0], fy = intrinsics[1][1], cx = intrinsics[2][0], cy = intrinsics[2][1]
+        let toCamera = cameraTransform.inverse
+        // ARKit camera space: x right, y up, looking down −z, in the sensor's native (landscape) orientation,
+        // which is also capturedImage's.
+        func unproject(_ p: SIMD2<Float>, _ d: Float) -> SIMD3<Float> {
+            let h = cameraTransform * SIMD4<Float>((p.x - cx) / fx * d, -(p.y - cy) / fy * d, -d, 1)
+            return SIMD3(h.x, h.y, h.z)
+        }
+        func project(_ p: SIMD3<Float>) -> SIMD2<Float>? {
+            let c = toCamera * SIMD4<Float>(p, 1)
+            guard -c.z > 0.05 else { return nil }
+            return SIMD2(cx + fx * c.x / -c.z, cy - fy * c.y / -c.z)
+        }
+
+        // 1) Joints in 3D: a robust skin surface over the back of the hand (triangle wrist – index MCP – little
+        //    MCP) gives each joint's depth without single-pixel LiDAR noise; then world space, smoothed there.
+        let anchors = pts.compactMap { p in sampler.depth(at: p).map { (p, $0) } }
+        var handSamples: [(SIMD2<Float>, Float)] = []
+        let n = 12
+        for i in 0...n {
+            for j in 0...(n - i) {
+                let a = Float(i) / Float(n), b = Float(j) / Float(n)
+                let p = pts[0] + a * (pts[1] - pts[0]) + b * (pts[4] - pts[0])
+                if let d = sampler.depth(at: p) { handSamples.append((p, d)) }
+            }
+        }
+        guard let handSkin = SkinSurface(samples: handSamples, anchors: anchors) else {
+            return Result(positions: nil, status: "Hold your hand 20–50 cm from the camera.")
+        }
+        var world = pts.map { unproject($0, handSkin.depth(at: $0)) }
+        for k in 0..<world.count {
+            for axis in 0..<3 {
+                world[k][axis] = Float(filters[3 * k + axis].filter(Double(world[k][axis]), time: time))
+            }
+        }
+
+        // 2) Rigid hand frame, with the hand's real size measured once and then frozen: the wound keeps one
+        //    spot and one size on the hand instead of following every per-frame joint error. Right hands are
+        //    mirror images of the (left-hand) template.
+        let sgn: Float = side ? 1 : -1
+        let template = handTemplate.map { SIMD3<Float>($0.x * sgn, $0.y, 0) }
+        guard let frameW = handAxes(world), let frameT = handAxes(template) else {
+            return Result(positions: nil, status: "Tracking…")
+        }
+        if scaleSamples.count < Tracking.scaleFrames {
+            scaleSamples.append(simd_distance(world[1], world[4]) / simd_distance(template[1], template[4]))
+        }
+        let scale = scaleSamples.sorted()[scaleSamples.count / 2]
+
+        // 3) Wound grid: picture point → hand-template point → world point on the hand → current image pixel.
         let w = Wound.scale, h = w * aspect, t = Wound.rotationDegrees * .pi / 180
-        // 1) Image position of every wound-grid vertex (picture point → hand-local (u, v) → spline → pixel).
         var pixels: [SIMD2<Float>] = []
         pixels.reserveCapacity((segments + 1) * (segments + 1))
         for iy in 0...segments {
             for ix in 0...segments {
                 let px = (Float(ix) / Float(segments) - 0.5) * w, py = (Float(iy) / Float(segments) - 0.5) * h
                 let rx = px * cos(t) - py * sin(t), ry = px * sin(t) + py * cos(t)
-                pixels.append(tps.eval(SIMD2(Wound.xOffset * sgn + rx, Wound.yOffset - ry)))
+                let q = SIMD3<Float>(Wound.xOffset * sgn + rx, Wound.yOffset - ry, 0) - frameT.centre
+                let along = simd_dot(q, frameT.x), across = simd_dot(q, frameT.y)
+                let onHand = frameW.centre + scale * (along * frameW.x + across * frameW.y)
+                guard let pixel = project(onHand) else { return Result(positions: nil, status: "Tracking…") }
+                pixels.append(pixel)
             }
         }
-        // 2) LiDAR depth there; one smooth skin surface fitted to it, seeded by the depth at the joints.
+        // 4) LiDAR depth there; one smooth skin surface fitted to it, seeded by the depth at the joints.
         let measured = pixels.map { sampler.depth(at: $0) }
         let samples = zip(pixels, measured).compactMap { p, m in m.map { (p, $0) } }
-        let anchors = pts.compactMap { p in sampler.depth(at: p).map { (p, $0) } }
         guard let skin = SkinSurface(samples: samples, anchors: anchors) else {
             return Result(positions: nil, status: "Hold your hand 20–50 cm from the camera.")
         }
-        // 3) Every vertex on that surface, plus a visibility margin: positive where the LiDAR sees this skin,
+        // 5) Every vertex on that surface, plus a visibility margin: positive where the LiDAR sees this skin,
         //    negative where something is in front (the other hand) or the hand has ended (background).
         let stride = segments + 1
         var positions: [SIMD3<Float>] = [], uvs: [SIMD2<Float>] = [], margin: [Float] = []
@@ -202,19 +254,15 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
             f = max(f, -Wound.edgeClamp)
             margin.append(f)
             if f > 0 { visiblePixels.append(pixel) }
-            // Unproject with the camera intrinsics. ARKit camera space: x right, y up, looking down −z,
-            // in the sensor's native (landscape) orientation, which is also capturedImage's.
-            let camPoint = SIMD4<Float>((pixel.x - cx) / fx * d, -(pixel.y - cy) / fy * d, -d, 1)
-            let world = cameraTransform * camPoint
-            positions.append(SIMD3(world.x, world.y, world.z))
+            positions.append(unproject(pixel, d))
             uvs.append(SIMD2(Float(i % stride) / Float(segments), 1 - Float(i / stride) / Float(segments)))
         }
-        // 4) Match the wound's brightness to the skin it sits on (the camera image under the wound).
+        // 6) Match the wound's brightness to the skin it sits on (the camera image under the wound).
         if let luma = meanLuma(image, at: visiblePixels) {
             let target = min(max(luma / Wound.referenceLuma, Wound.tintRange.lowerBound), Wound.tintRange.upperBound)
             tint += 0.3 * (target - tint)
         }
-        // 5) Cut the mesh along the margin's zero line: each grid triangle is clipped against it
+        // 7) Cut the mesh along the margin's zero line: each grid triangle is clipped against it
         //    (Sutherland–Hodgman, one clip plane) with new edge vertices interpolated, so the wound's outline
         //    follows the hand's edge and the other hand's fingers smoothly. Both windings: nothing is culled.
         var indices: [UInt32] = []
@@ -243,15 +291,46 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
         return Result(positions: positions, uvs: uvs, indices: indices, tint: tint, status: "")
     }
 
-    private func pickHand(_ hands: [VNHumanHandPoseObservation]) -> VNHumanHandPoseObservation? {
-        guard !hands.isEmpty else { return nil }
-        if let locked = lockedLeft, let match = hands.first(where: { $0.chirality == (locked ? .left : .right) }) { return match }
-        return hands.first
+    // The hand to put the wound on: the one nearest to where it was last seen, so the other hand can't steal
+    // the wound when Vision gives both the same left/right label; the locked left/right breaks ties.
+    private func pickHand(_ hands: [VNHumanHandPoseObservation], _ resolution: SIMD2<Float>)
+        -> (VNHumanHandPoseObservation, [SIMD2<Float>])? {
+        var best: (VNHumanHandPoseObservation, [SIMD2<Float>])?
+        var bestScore = Float.infinity
+        for hand in hands {
+            guard let pts = jointPixels(hand, resolution) else { continue }
+            var score: Float = 0
+            if let last = lastCentroid {
+                let c = pts.reduce(SIMD2<Float>()) { $0 + $1 } / Float(pts.count)
+                score += simd_distance(c, last) / lastHandSize
+            }
+            if let locked = lockedLeft, hand.chirality == (locked ? .right : .left) { score += 1 }
+            if score < bestScore {
+                best = (hand, pts)
+                bestScore = score
+            }
+        }
+        // While we still remember the hand, a hand far from it is the other one: treat as lost, don't jump.
+        if lastCentroid != nil, bestScore > Tracking.maxJump { return nil }
+        return best
+    }
+
+    // Wrist + MCP image points in capturedImage pixels (Vision: normalized, origin bottom-left).
+    private func jointPixels(_ hand: VNHumanHandPoseObservation, _ resolution: SIMD2<Float>) -> [SIMD2<Float>]? {
+        var pts: [SIMD2<Float>] = []
+        for name in joints {
+            guard let p = try? hand.recognizedPoint(name), p.confidence > 0.3 else { return nil }
+            pts.append(SIMD2(Float(p.location.x) * resolution.x, (1 - Float(p.location.y)) * resolution.y))
+        }
+        return pts
     }
 
     private func reset() {
         filters.forEach { $0.reset() }
         lockedLeft = nil
+        lastCentroid = nil
+        dorsal = nil
+        scaleSamples.removeAll()
     }
 
     // MARK: Rendering (main thread)

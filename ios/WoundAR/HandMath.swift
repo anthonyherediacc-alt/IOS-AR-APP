@@ -50,46 +50,24 @@ final class OneEuroFilter {
     }
 }
 
-// Swift port of thin-plate-spline (MIT, https://github.com/pravoobi/try-on, npm "thin-plate-spline"):
-// kernel r² log r², system [[K, P], [Pᵀ, 0]] [w; a] = [v; 0], Gaussian elimination with partial pivoting.
-struct ThinPlateSpline {
-    let controlPoints: [SIMD2<Float>]
-    private let wx: [Float], wy: [Float], ax: SIMD3<Float>, ay: SIMD3<Float>
-
-    init?(src: [SIMD2<Float>], dst: [SIMD2<Float>]) {
-        let n = src.count
-        guard n >= 3, dst.count == n else { return nil }
-        let size = n + 3
-        var m = [[Double]](repeating: [Double](repeating: 0, count: size), count: size)
-        for i in 0..<n {
-            for j in 0..<n { m[i][j] = Double(ThinPlateSpline.kernel(simd_length_squared(src[i] - src[j]))) }
-            m[i][n] = 1; m[i][n + 1] = Double(src[i].x); m[i][n + 2] = Double(src[i].y)
-            m[n][i] = 1; m[n + 1][i] = Double(src[i].x); m[n + 2][i] = Double(src[i].y)
-        }
-        guard let sx = solveLinearSystem(m, dst.map { Double($0.x) } + [0, 0, 0]),
-              let sy = solveLinearSystem(m, dst.map { Double($0.y) } + [0, 0, 0]) else { return nil }
-        controlPoints = src
-        wx = sx[0..<n].map { Float($0) }
-        wy = sy[0..<n].map { Float($0) }
-        ax = SIMD3(Float(sx[n]), Float(sx[n + 1]), Float(sx[n + 2]))
-        ay = SIMD3(Float(sy[n]), Float(sy[n + 1]), Float(sy[n + 2]))
-    }
-
-    static func kernel(_ r2: Float) -> Float { r2 <= 0 ? 0 : r2 * log(r2) }
-
-    func eval(_ p: SIMD2<Float>) -> SIMD2<Float> {
-        var x = ax.x + ax.y * p.x + ax.z * p.y
-        var y = ay.x + ay.y * p.x + ay.z * p.y
-        for i in 0..<controlPoints.count {
-            let k = ThinPlateSpline.kernel(simd_length_squared(p - controlPoints[i]))
-            x += wx[i] * k
-            y += wy[i] * k
-        }
-        return SIMD2(x, y)
-    }
+// Rigid hand frame from the wrist + 4 MCPs (handTemplate order): origin = their centroid, x toward the index
+// MCP (from the little MCP), y toward the knuckles (wrist → MCP centroid, made perpendicular to x; Gram–Schmidt).
+// Built the same way for the template (z = 0) and for the 3D joints, so a template point q lands on the hand at
+// centre + scale·(⟨q − c, x⟩·X + ⟨q − c, y⟩·Y).
+func handAxes(_ p: [SIMD3<Float>]) -> (centre: SIMD3<Float>, x: SIMD3<Float>, y: SIMD3<Float>)? {
+    guard p.count == 5 else { return nil }
+    let centre = p.reduce(SIMD3<Float>()) { $0 + $1 } / 5
+    let lateral = p[1] - p[4]
+    let forward = (p[1] + p[2] + p[3] + p[4]) / 4 - p[0]
+    guard simd_length(lateral) > 1e-6 else { return nil }
+    let x = simd_normalize(lateral)
+    let y = forward - simd_dot(forward, x) * x
+    guard simd_length(y) > 1e-6 else { return nil }
+    return (centre, x, simd_normalize(y))
 }
 
-// Gaussian elimination with partial pivoting (from the thin-plate-spline port above); nil if singular.
+// Gaussian elimination with partial pivoting, ported from the thin-plate-spline package's solver
+// (MIT, https://github.com/pravoobi/try-on, npm "thin-plate-spline"); nil if singular.
 func solveLinearSystem(_ a: [[Double]], _ b: [Double]) -> [Double]? {
     let n = b.count
     var m = a, rhs = b
