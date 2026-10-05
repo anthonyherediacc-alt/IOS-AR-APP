@@ -15,6 +15,7 @@ html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 15px 
 #panel label { display: flex; flex-direction: column; gap: 4px; }
 #panel small { opacity: .7; font-size: 12px; }
 #panel input[type=range] { width: 100%; }
+#panel label.check { flex-direction: row; align-items: center; gap: 8px; }
 #panel .button { position: relative; padding: 10px; border: 0; border-radius: 6px; background: #444; color: #fff; font-size: 15px; text-align: center; }
 /* Visually hidden but still tappable via its label (iOS won't open a display:none file input). */
 #panel input[type=file] { position: absolute; inset: 0; opacity: 0; width: 100%; }

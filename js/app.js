@@ -1,9 +1,9 @@
-import { WOUNDS, SETTINGS, TRACKING } from "./config.js";
+import { WOUNDS, SETTINGS, TRACKING, RENDER } from "./config.js";
 import {
-  vision, createHandLandmarker, createPose, getHandPose, createLandmarkSmoother, projectLocal, getDorsalVisibility,
-  getFacingLabel, TEMPLATE,
+  vision, createHandLandmarker, createPose, getHandPose, createLandmarkSmoother, createDorsalSurface, projectLocal,
+  getDorsalVisibility, getFacingLabel, TEMPLATE,
 } from "./handTracker.js";
-import { createRenderer, loadWoundImage, woundCorners } from "./woundRenderer.js";
+import { createRenderer, loadWoundImage, woundPointPx } from "./woundRenderer.js";
 import { initControls } from "./controls.js";
 
 const $ = (id) => document.getElementById(id);
@@ -12,7 +12,10 @@ const statusEl = $("status"), debugEl = $("debugInfo"), startBtn = $("start");
 
 const raw = createPose(), pose = createPose(); // pose = from smoothed landmarks (rendered); raw = debug only
 const smoother = createLandmarkSmoother(TRACKING);
+const dorsal = createDorsalSurface();
+let surf = { xy: null }; // curved skin surface for the current frame
 const cam = { f: 1, cx: 0, cy: 0 }; // pinhole intrinsics in video pixels
+let lastPalm = null; // palm centre of the wound hand last frame, to keep following the same hand
 const visibility = { visible: false };
 let lockedRight = null; // handedness locked for the current track, so it can't flip near edge-on
 let landmarker, drawingUtils, renderer, lastVideoTime = -1, busy = false, inferMs = 0;
@@ -136,30 +139,47 @@ async function processFrame() {
   renderer.hideWound();
   ctx.clearRect(0, 0, w, h);
 
-  const lm = result.landmarks[0];
-  const hd = result.handedness[0]?.[0];
+  const wi = pickWoundHand(result);
+  const lm = result.landmarks[wi], hd = result.handedness[wi]?.[0];
+  const other = TRACKING.occlusion && result.landmarks.length > 1 ? result.landmarks[1 - wi] : null;
+  renderer.setOccluder(other, w, h, TRACKING.occluderThickness, SETTINGS.debug);
   if (!lm || !hd) {
     // Hide the wound. Its placement is hand-local config, so it reappears in the same spot on
     // the hand when tracking returns; the filter restarts so it doesn't slide in from the old pose.
     smoother.reset();
     visibility.visible = false;
     lockedRight = null;
+    lastPalm = null;
     setStatus("Show your hand to the camera.");
     if (SETTINGS.debug) debugEl.textContent = `${fps} fps · ${inferMs | 0} ms · no hand`;
   } else {
     if (statusEl.textContent) setStatus("");
+    lastPalm = lm[9];
     if (lockedRight === null && hd.score >= TRACKING.handednessMinScore) lockedRight = hd.categoryName === "Right";
     const isRight = lockedRight ?? hd.categoryName === "Right";
     // Smooth the landmarks, then solve the pose once from them (MediaPipe's order of operations).
     if (getHandPose(smoother.apply(lm, w, h, now / 1000), isRight, w, h, cam, pose)) {
       const alpha = getDorsalVisibility(visibility, pose.facing, TRACKING);
-      renderer.setWound(currentWound(), pose, alpha);
-      if (SETTINGS.debug && getHandPose(lm, isRight, w, h, cam, raw)) drawDebug(lm, hd, isRight, alpha);
+      surf = dorsal.update(pose, RENDER.skinThickness);
+      renderer.setWound(currentWound(), pose, surf, alpha);
+      if (SETTINGS.debug && getHandPose(lm, isRight, w, h, cam, raw)) drawDebug(lm, hd, isRight, alpha, other);
     }
   }
   renderer.render();
   if (frameImg !== video) frameImg.close(); // after render: the texture upload happens inside render()
   updateFps();
+}
+
+// With two hands in view, keep the wound on the same hand: prefer the locked left/right label, else the
+// hand nearest to where the wound hand was last frame. Returns the index into the result arrays.
+function pickWoundHand(result) {
+  const n = result.landmarks.length;
+  if (n < 2) return 0;
+  const labels = result.handedness.map((h) => h[0]?.categoryName === "Right");
+  if (lockedRight !== null && labels[0] !== labels[1]) return labels[0] === lockedRight ? 0 : 1;
+  if (!lastPalm) return 0;
+  const d = result.landmarks.map((lm) => Math.hypot(lm[9].x - lastPalm.x, lm[9].y - lastPalm.y));
+  return d[1] < d[0] ? 1 : 0;
 }
 
 const dbg = new Float64Array(12);
@@ -187,12 +207,25 @@ function drawFrame(p, width, len) {
   const X = p.o[0] + len * p.n[0], Y = p.o[1] + len * p.n[1], Z = p.o[2] + len * p.n[2];
   line(dbg[0], dbg[1], cam.cx + (cam.f * X) / Z, cam.cy + (cam.f * Y) / Z, p.facing > 0 ? "#0ff" : "#f0f", width);
 }
-function drawQuad(p, color, width) {
-  if (!woundCorners(currentWound(), p, cam, dbg)) return;
-  for (const [i, j] of [[0, 1], [1, 3], [3, 2], [2, 0]]) line(dbg[3 * i], dbg[3 * i + 1], dbg[3 * j], dbg[3 * j + 1], color, width);
+// Wound outline traced along its edges on the curved skin surface.
+function drawOutline(color, width) {
+  const steps = 8, pts = [];
+  for (let k = 0; k < 4 * steps; k++) {
+    const e = Math.floor(k / steps), t = (k % steps) / steps;
+    const [fx, fy] = [[t, 0], [1, t], [1 - t, 1], [0, 1 - t]][e];
+    if (!woundPointPx(currentWound(), pose, surf, cam, fx, fy, dbg)) return;
+    pts.push([dbg[0], dbg[1]]);
+  }
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.beginPath();
+  pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+  ctx.closePath();
+  ctx.stroke();
 }
 
-function drawDebug(lm, hd, isRight, alpha) {
+function drawDebug(lm, hd, isRight, alpha, other) {
+  if (other) drawingUtils.drawConnectors(other, vision.HandLandmarker.HAND_CONNECTIONS, { color: "#39f", lineWidth: 3 }); // occluding hand
   drawingUtils.drawConnectors(lm, vision.HandLandmarker.HAND_CONNECTIONS, { color: "rgba(0,255,0,.5)", lineWidth: 1 });
   drawingUtils.drawLandmarks(lm, { color: "#f00", radius: 2 });
   const w = canvas.width, h = canvas.height;
@@ -206,13 +239,12 @@ function drawDebug(lm, hd, isRight, alpha) {
   // Raw pose: thin; filtered pose: thick. If thick follows thin with a gap, it's filter lag;
   // if both wander off the skin, it's the tracker.
   drawFrame(raw, 1, 0.6);
-  drawQuad(raw, "#f0f", 1);
   drawFrame(pose, 4, 0.6);
-  drawQuad(pose, "#ff0", 3);
+  drawOutline("#ff0", 3);
   projectLocal(pose, cam, 0, 0, dbg, 0);
   dot(dbg[0], dbg[1], 6, "#ff0");
   debugEl.textContent = `${fps} fps · ${inferMs | 0} ms · ${isRight ? "right" : "left"} hand (${(hd.score * 100) | 0}%) · ` +
-    `${getFacingLabel(pose.facing, TRACKING)} · facing ${pose.facing.toFixed(2)} · α ${alpha.toFixed(2)}`;
+    `${getFacingLabel(pose.facing, TRACKING)} · facing ${pose.facing.toFixed(2)} · α ${alpha.toFixed(2)}${other ? " · other hand" : ""}`;
 }
 
 function updateFps() {
@@ -235,4 +267,5 @@ debugToggle.addEventListener("change", () => {
 });
 debugEl.hidden = !SETTINGS.debug;
 WOUNDS.forEach(loadWoundImage); // preload
-initControls(currentWound, (msg) => alert(msg)); // alert: status text is overwritten each frame
+// alert: status text is overwritten each frame. Occlusion needs MediaPipe to track 2 hands.
+initControls(currentWound, (msg) => alert(msg), (on) => landmarker?.setOptions({ numHands: on ? 2 : 1 }));

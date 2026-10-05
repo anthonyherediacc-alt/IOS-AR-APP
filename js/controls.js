@@ -1,12 +1,16 @@
-import { WOUNDS, SETTINGS, TRACKING } from "./config.js";
+import { WOUNDS, SETTINGS, TRACKING, RENDER } from "./config.js";
 
-// Side panel: live position/size offsets, steadiness, a user-supplied picture, and reset to defaults.
+// Side panel: live position/size offsets, skin height, steadiness, other-hand cutout, a user-supplied
+// picture, and reset to defaults.
 // Edits the active wound entry in place; the renderer reads it every frame.
-const DEFAULTS = { woundId: SETTINGS.woundId, wounds: WOUNDS.map((w) => ({ ...w })), steadiness: TRACKING.steadiness };
+const DEFAULTS = {
+  woundId: SETTINGS.woundId, wounds: WOUNDS.map((w) => ({ ...w })),
+  steadiness: TRACKING.steadiness, surfaceHeight: RENDER.surfaceHeight, occlusion: TRACKING.occlusion,
+};
 const FIELDS = { ctlX: "xOffset", ctlY: "yOffset", ctlScale: "scale" };
 let customCount = 0;
 
-export function initControls(currentWound, showError) {
+export function initControls(currentWound, showError, onOcclusion) {
   const $ = (id) => document.getElementById(id);
   const toggle = $("panelToggle"), panel = $("panel"), file = $("ctlFile");
 
@@ -18,8 +22,12 @@ export function initControls(currentWound, showError) {
   const sync = () => {
     for (const [id, key] of Object.entries(FIELDS)) $(id).value = currentWound()[key];
     $("ctlSteady").value = TRACKING.steadiness;
+    $("ctlHeight").value = RENDER.surfaceHeight;
+    $("ctlOcclusion").checked = TRACKING.occlusion;
   };
   $("ctlSteady").addEventListener("input", (e) => { TRACKING.steadiness = Number(e.target.value); });
+  $("ctlHeight").addEventListener("input", (e) => { RENDER.surfaceHeight = Number(e.target.value); });
+  $("ctlOcclusion").addEventListener("change", (e) => { TRACKING.occlusion = e.target.checked; onOcclusion(TRACKING.occlusion); });
   for (const [id, key] of Object.entries(FIELDS)) {
     $(id).addEventListener("input", (e) => { currentWound()[key] = Number(e.target.value); });
   }
@@ -49,6 +57,8 @@ export function initControls(currentWound, showError) {
     DEFAULTS.wounds.forEach((d, i) => Object.assign(WOUNDS[i], d));
     SETTINGS.woundId = DEFAULTS.woundId;
     TRACKING.steadiness = DEFAULTS.steadiness;
+    RENDER.surfaceHeight = DEFAULTS.surfaceHeight;
+    if (TRACKING.occlusion !== DEFAULTS.occlusion) onOcclusion((TRACKING.occlusion = DEFAULTS.occlusion));
     file.value = "";
     sync();
   });

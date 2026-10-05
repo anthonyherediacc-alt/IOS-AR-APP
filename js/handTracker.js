@@ -1,6 +1,7 @@
-import { MEDIAPIPE } from "./config.js";
+import { MEDIAPIPE, TRACKING } from "./config.js";
 import SVD from "./vendor/svd.js";
 import { OneEuroFilter } from "./vendor/OneEuroFilter.js";
+import { ThinPlateSpline } from "./vendor/thin-plate-spline.js";
 
 // MediaPipe hand landmark indices.
 const WRIST = 0, INDEX_MCP = 5, MIDDLE_MCP = 9, RING_MCP = 13, PINKY_MCP = 17;
@@ -15,7 +16,7 @@ export async function createHandLandmarker() {
   const opts = (delegate) => ({
     baseOptions: { modelAssetPath: MEDIAPIPE.modelUrl, delegate },
     runningMode: "VIDEO",
-    numHands: 1,
+    numHands: TRACKING.occlusion ? 2 : 1, // 2 = also track the other hand so it can cover the wound
   });
   try {
     return await vision.HandLandmarker.createFromOptions(fileset, opts("GPU"));
@@ -34,7 +35,7 @@ const normalize = (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; a[0] /= 
 // barely affects the fit.
 export const TEMPLATE = [[0, -0.995], [0.51, 0.334], [0.135, 0.337], [-0.187, 0.238], [-0.458, 0.086]];
 
-export const createPose = () => ({ o: [0, 0, 0], x: [1, 0, 0], y: [0, 1, 0], n: [0, 0, 1], indexSide: 1, facing: 0 });
+export const createPose = () => ({ o: [0, 0, 0], x: [1, 0, 0], y: [0, 1, 0], n: [0, 0, 1], indexSide: 1, facing: 0, pts: TEMPLATE.map(() => [0, 0, 0]) });
 
 // ---- Pose: port of MediaPipe's face-geometry pipeline with a hand canonical model -------------------
 // Portions Copyright The MediaPipe Authors, Apache-2.0; modified (JS port, hand model). See THIRD_PARTY_NOTICES.md.
@@ -130,8 +131,57 @@ export function getHandPose(lm, isRight, w, h, cam, out) {
   out.x[0] = RS[0][0]; out.x[1] = -RS[1][0]; out.x[2] = -RS[2][0];
   out.y[0] = RS[0][1]; out.y[1] = -RS[1][1]; out.y[2] = -RS[2][1];
   out.indexSide = sgn;
+  // Unprojected 3D positions of the dorsal landmarks (they reproject exactly onto the image points);
+  // the curved skin surface below is fitted through these.
+  for (let k = 0; k < NP; k++) { out.pts[k][0] = MET[k][0]; out.pts[k][1] = -MET[k][1]; out.pts[k][2] = -MET[k][2]; }
   finishPose(out);
   return true;
+}
+
+// ---- Curved back-of-hand surface ---------------------------------------------------------------
+// The rigid pose is a flat plane through the joint centres, but the back of the hand arches across the
+// knuckles and slopes to the wrist. A thin-plate spline (vendored thin-plate-spline, MIT) maps the hand
+// canonical (u, v) layout exactly onto the joints' 3D positions, giving a smooth curved surface; skin
+// thickness above the joint centres (wrist → knuckles) is interpolated by the same spline. A point on
+// the skin = surface point + thickness × local surface normal (not one offset for the whole wound).
+export function createDorsalSurface() {
+  const surf = { xy: null, zt: null };
+  return {
+    update(pose, thickness) {
+      const src = TEMPLATE.map(([u, v]) => [pose.indexSide * u, v]);
+      surf.xy = new ThinPlateSpline(src, pose.pts.map((p) => [p[0], p[1]]));
+      surf.zt = new ThinPlateSpline(src, pose.pts.map((p, k) => [p[2], k === 0 ? thickness.wrist : thickness.knuckles]));
+      return surf;
+    },
+  };
+}
+
+// Allocation-free evaluation of the fitted splines (same formula as ThinPlateSpline.eval).
+function tps(s, u, v, o) {
+  let a = s.ax[0] + s.ax[1] * u + s.ax[2] * v, b = s.ay[0] + s.ay[1] * u + s.ay[2] * v;
+  const cp = s.controlPoints;
+  for (let i = 0; i < cp.length; i++) {
+    const du = u - cp[i][0], dv = v - cp[i][1], r2 = du * du + dv * dv, k = r2 > 0 ? r2 * Math.log(r2) : 0;
+    a += s.wx[i] * k; b += s.wy[i] * k;
+  }
+  o[0] = a; o[1] = b;
+}
+const SA = [0, 0], SB = [0, 0], DU = [0, 0, 0], DV = [0, 0, 0];
+function surfaceAt(surf, u, v, o) { tps(surf.xy, u, v, SA); tps(surf.zt, u, v, SB); o[0] = SA[0]; o[1] = SA[1]; o[2] = SB[0]; return SB[1]; }
+
+// Skin point at hand-local (u, v): curved surface + thickness × scale along the local normal
+// (finite differences; ∂/∂u × ∂/∂v points out of the back of the hand). Writes out[k..k+2] (camera frame).
+const SP = [0, 0, 0], SQ = [0, 0, 0];
+export function skinPoint(surf, u, v, thicknessScale, out, k) {
+  const e = 0.02;
+  const t = surfaceAt(surf, u, v, SP);
+  surfaceAt(surf, u + e, v, DU); surfaceAt(surf, u - e, v, SQ);
+  for (let j = 0; j < 3; j++) DU[j] -= SQ[j];
+  surfaceAt(surf, u, v + e, DV); surfaceAt(surf, u, v - e, SQ);
+  for (let j = 0; j < 3; j++) DV[j] -= SQ[j];
+  const nx = DU[1] * DV[2] - DU[2] * DV[1], ny = DU[2] * DV[0] - DU[0] * DV[2], nz = DU[0] * DV[1] - DU[1] * DV[0];
+  const s = (t * thicknessScale) / (Math.hypot(nx, ny, nz) || 1);
+  out[k] = SP[0] + nx * s; out[k + 1] = SP[1] + ny * s; out[k + 2] = SP[2] + nz * s;
 }
 
 // ---- Landmark smoothing: MediaPipe's LandmarksSmoothingCalculator (one_euro_filter) pattern ---------

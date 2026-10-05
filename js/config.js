@@ -49,6 +49,8 @@ export const TRACKING = {
     responsive: { minCutoff: 0.3, beta: 40, dCutoff: 3 },
     steady: { minCutoff: 0.05, beta: 5, dCutoff: 1 },
   },
+  occlusion: true, // also track the other hand and hide the wound where it passes in front (Adjust panel)
+  occluderThickness: 1, // scales the other hand's cutout (finger radius ≈ 0.12 hand widths)
   focalLength: 0.75, // camera focal length ÷ video long side (iPhone main camera ≈ 0.75)
   frameSync: true, // track and display the same captured frame (overlay can't lag the video)
   // facing = cos(angle between back-of-hand normal and camera direction); 1 = back faces camera.
@@ -61,9 +63,12 @@ export const TRACKING = {
 };
 
 export const RENDER = {
-  // MediaPipe landmarks are joint centres (bone level). Lift the wound this far along the back-of-hand
-  // normal so it sits on the skin, not inside the hand (hand widths; ~0.15 ≈ 1 cm).
-  surfaceOffset: 0.15,
+  // MediaPipe landmarks are joint centres (bone level). The wound is curved along a surface through them
+  // and lifted by this skin thickness along the local normal (hand widths; 0.15 ≈ 1 cm), interpolated
+  // from the wrist to the knuckles. surfaceHeight scales it (Adjust panel).
+  skinThickness: { wrist: 0.22, knuckles: 0.13 },
+  surfaceHeight: 1,
+  subdivisions: 16, // wound grid resolution per side
   ambientLight: 1.6, // camera-fixed lights for the wound's 3D shading
   keyLight: 2.0,
 };
