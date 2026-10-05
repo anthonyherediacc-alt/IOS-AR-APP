@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>AR Wound Sim</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- playsinline + muted are required for inline autoplay in iOS Safari -->
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+  <div id="status">Tap Start to begin.</div>
+  <button id="start">Start Camera</button>
+  <div id="hud">
+    <label><input type="checkbox" id="debug"> Debug</label>
+    <span id="debugInfo"></span>
+  </div>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

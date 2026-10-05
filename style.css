@@ -1,0 +1,11 @@
+html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 15px -apple-system, system-ui, sans-serif; overflow: hidden; }
+/* Video and canvas must share identical sizing/fit so overlay pixels line up. */
+#video, #overlay { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+#overlay { pointer-events: none; }
+#status { position: fixed; left: 16px; right: 16px; top: 40%; text-align: center; padding: 12px; background: rgba(0,0,0,.6); border-radius: 8px; }
+#status[hidden] { display: none; }
+#start { position: fixed; left: 50%; bottom: calc(40px + env(safe-area-inset-bottom)); transform: translateX(-50%); padding: 14px 28px; font-size: 18px; border-radius: 10px; border: 0; background: #d22; color: #fff; }
+#start:disabled { opacity: .5; }
+#start[hidden] { display: none; }
+#hud { position: fixed; left: 8px; top: calc(8px + env(safe-area-inset-top)); padding: 6px 10px; background: rgba(0,0,0,.5); border-radius: 6px; display: flex; gap: 10px; align-items: center; }
+#debugInfo { font: 12px ui-monospace, monospace; }
