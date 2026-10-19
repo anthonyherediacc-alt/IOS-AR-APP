@@ -76,6 +76,19 @@ final class TrackingCoreTests: XCTestCase {
         var invalid = p; invalid.world = [.nan,0,0]
         XCTAssertThrowsError(try JSONEncoder().encode(invalid))
     }
+    func testPacketRoundTripRetainsOriginAndProvenance() throws {
+        let packet = TrackingPacket(sessionID:"synthetic",frameID:7,timestamp:1.25,worldOriginEpoch:3,
+            backend:"Vision 2D + depth",targetID:"synthetic-target",targetLabel:"mannequin",state:"tracking",
+            observationAge:0,cameraPose:TrackingGeometry.matrix(matrix_identity_float4x4),
+            joints:[TrackedPoint(name:"leftKnee",image:[0.2,0.3],world:[1,2,3],provenance:"vision2D+depthSurface")],
+            events:[],inferenceMS:2,smoothingTimeConstant:0)
+        let copy = try JSONDecoder().decode(TrackingPacket.self,from:JSONEncoder().encode(packet))
+        XCTAssertEqual(copy.worldOriginEpoch,3)
+        XCTAssertEqual(copy.joints[0].world,[1,2,3])
+        XCTAssertEqual(copy.joints[0].provenance,"vision2D+depthSurface")
+        XCTAssertNil(copy.bodyRootPose)
+        XCTAssertNil(copy.joints[0].confidence)
+    }
 }
 
 private func assertVector(_ a: SIMD2<Float>, _ b: SIMD2<Float>, accuracy: Float, file: StaticString = #filePath, line: UInt = #line) {

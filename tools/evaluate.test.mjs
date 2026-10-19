@@ -18,5 +18,9 @@ test('missing landmark remains unavailable',()=>{
  assert.equal(r.selectedTargetAvailability,0);assert.equal(r.meanLandmarkErrorNormalizedUV,null);
 });
 test('epoch separates repeated frame ids',()=>{
- assert.throws(()=>evaluate([frame],[{...frame,worldOriginEpoch:2}]),/Missing/);
+ assert.throws(()=>evaluate([frame],[{...frame,worldOriginEpoch:2,targetPresent:true}]),/Missing/);
+});
+test('annotations cannot silently omit truth or use fake coordinates',()=>{
+ assert.throws(()=>evaluate([frame],[frame]),/Boolean/);
+ assert.throws(()=>evaluate([frame],[{...frame,targetPresent:true,joints:{leftKnee:[NaN,0]}}]),/Invalid/);
 });

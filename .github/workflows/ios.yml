@@ -8,6 +8,20 @@ on:
     paths: ["ios/**", "integration/**", "tools/**", ".github/workflows/ios.yml"]
   workflow_dispatch:
 jobs:
+  baseline:
+    name: Original hand-demo baseline
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: f742507b9654dc71310571efb40bb7ea40ef058a
+      - run: brew install xcodegen
+      - name: Compile original application
+        working-directory: ios
+        run: |
+          xcodegen generate
+          xcodebuild -project WoundAR.xcodeproj -target WoundAR -configuration Release -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
   build:
     runs-on: macos-15
     defaults:
@@ -39,3 +53,8 @@ jobs:
         with:
           name: WoundAR-ipa
           path: ios/WoundAR.ipa
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tracking-test-log
+          path: ios/tracking-tests.log

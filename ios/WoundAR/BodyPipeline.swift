@@ -54,7 +54,7 @@ final class ARKitBodyDetector: BodyDetector {
                 let world = anchor.transform * skeleton.jointModelTransforms[i]
                 let p = world.columns.3
                 let tracked = skeleton.isJointTracked(i)
-                let parent = skeleton.definition.parentIndices[i].intValue
+                let parent = skeleton.definition.parentIndices[i]
                 let image = frame.camera.projectPoint(SIMD3(p.x,p.y,p.z), orientation: .landscapeRight,
                                                        viewportSize: frame.camera.imageResolution)
                 return TrackedPoint(name: name,
