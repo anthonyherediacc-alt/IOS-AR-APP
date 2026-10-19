@@ -12,9 +12,12 @@ Needs an iPhone **Pro** (12 Pro or newer, has LiDAR) and iOS 17+.
 
 ## Get the app (from Windows, no Mac needed)
 1. GitHub builds it automatically: repo → **Actions** → "iOS app (unsigned IPA)" → latest green run →
-   **Artifacts** → download **WoundAR-ipa** and unzip it to get `WoundAR.ipa`.
+   **Artifacts** → download **WoundAR-v…-build…** and unzip it to get the versioned IPA.
+   Example: `WoundAR-v0.1-build19.1-abcdef0.ipa` means app version 0.1, workflow run 19,
+   attempt 1, built checkout commit abcdef0. The ZIP uses the same name. The embedded app
+   build number also matches `19.1`; a rerun increments the attempt so downloads stay distinct.
 2. Install **Sideloadly** (sideloadly.io) and Apple's iTunes + iCloud *from apple.com* (not the Microsoft Store).
-3. Plug the iPhone in, open Sideloadly, drag `WoundAR.ipa` in, enter your Apple ID, press **Start**.
+3. Plug the iPhone in, open Sideloadly, drag the extracted `.ipa` in, enter your Apple ID, press **Start**.
 4. On the iPhone: Settings → Privacy & Security → **Developer Mode** → On (restart), then
    Settings → General → **VPN & Device Management** → trust your Apple ID.
 5. With a free Apple ID the app stops opening after 7 days — repeat step 3 to refresh it.

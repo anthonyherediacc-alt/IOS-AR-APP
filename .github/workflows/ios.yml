@@ -41,18 +41,28 @@ jobs:
         run: swiftc -typecheck ../tools/infer-images.swift
       - run: brew install xcodegen
       - run: xcodegen generate
+      - name: Set build number
+        run: /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" WoundAR/Info.plist
       - name: Build (no code signing)
         run: |
           xcodebuild -project WoundAR.xcodeproj -target WoundAR -configuration Release -sdk iphoneos \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
       - name: Package .ipa
+        id: package
         run: |
+          app_plist="build/Release-iphoneos/WoundAR.app/Info.plist"
+          version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$app_plist")
+          build=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$app_plist")
+          commit=$(git rev-parse --short=7 HEAD)
+          name="WoundAR-v${version}-build${build}-${commit}"
           mkdir -p Payload && cp -R build/Release-iphoneos/WoundAR.app Payload/
-          zip -qr WoundAR.ipa Payload
+          zip -qr "${name}.ipa" Payload
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
-          name: WoundAR-ipa
-          path: ios/WoundAR.ipa
+          name: ${{ steps.package.outputs.name }}
+          path: ios/${{ steps.package.outputs.name }}.ipa
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: always()
         with:
