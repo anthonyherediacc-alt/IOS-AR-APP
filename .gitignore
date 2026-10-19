@@ -1,0 +1,9 @@
+ios/.build/
+ios/*.xcodeproj/
+ios/build/
+ios/Payload/
+*.ipa
+*.xcresult
+recordings/
+*.jsonl
+!integration/fixtures/*.jsonl

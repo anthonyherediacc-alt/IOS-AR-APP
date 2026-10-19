@@ -11,8 +11,21 @@ struct WoundARApp: App {
 struct ContentView: View {
     @StateObject private var session = WoundSession()
     @State private var showPanel = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
+        VStack(spacing: 0) {
+            Picker("Mode", selection: Binding(get: { session.mode }, set: { session.setMode($0) })) {
+                ForEach(AppMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+            }.pickerStyle(.menu)
+            if session.mode == .hand { handView } else { BodyTrackingView(session: session) }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { session.start() } else { session.stop() }
+        }
+    }
+
+    private var handView: some View {
         ZStack(alignment: .top) {
             MetalCameraView(session: session).ignoresSafeArea()
             if session.settings.debug {
