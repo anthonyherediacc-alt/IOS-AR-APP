@@ -104,7 +104,7 @@ final class BodyPipeline {
                                                        intrinsics: frame.camera.intrinsics, camera: frame.camera.transform) {
                     p.world = TrackingGeometry.array(w); p.provenance = "vision2D+depthSurface"
                     p.reason = "visible surface; not an internal joint; occluders can pass depth checks"
-                } else if backend == .vision { p.reason = "2D only: no reliable surface depth" }
+                } else if backend == .vision, p.image != nil { p.reason = "2D only: no reliable surface depth" }
                 return p
             }
         }

@@ -31,6 +31,7 @@ struct BodyTrackingView: View {
                     ForEach(BodyBackend.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }
                 Text(session.capabilities).font(.caption)
+                if !session.status.isEmpty { Text(session.status).font(.caption).foregroundStyle(.orange) }
                 if let snapshot = frozen ?? session.bodySnapshot {
                     TimelineView(.periodic(from: .now, by: 0.1)) { _ in
                         let age = max(0, ProcessInfo.processInfo.systemUptime - snapshot.packet.timestamp)
@@ -76,7 +77,9 @@ struct BodyTrackingView: View {
                 Button(session.recording ? "Stop recording" : "Start pose recording") {
                     if session.recording { session.stopRecording() } else { session.startRecording() }
                 }
-                if session.recording { Text("● RECORDING — pose/diagnostics only").foregroundStyle(.red) }
+                if session.recording {
+                    Text(session.captureImages ? "● RECORDING — pose + RGB/depth" : "● RECORDING — pose/diagnostics only").foregroundStyle(.red)
+                }
                 if let url = session.recordingURL, !session.recording {
                     ShareLink("Export JSONL", item: url)
                     ShareLink("Export session folder (includes opted-in imagery)", item: url.deletingLastPathComponent())

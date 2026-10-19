@@ -114,6 +114,7 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
     }
     func start() {
         stop()
+        status = ""
         let config: ARConfiguration
         if mode != .hand && backend == .arkit {
             guard ARBodyTrackingConfiguration.isSupported else {
