@@ -94,6 +94,10 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
     @Published var manualLandmarks: [ManualLandmark] = []
     @Published var calibrationRecord: CalibrationRecord?
     @Published var captureImages = false
+    @Published var streaming = false
+    @Published var streamStatus = "Stopped"
+    @Published var streamCode = ""
+    private let poseStream = PoseStream()
     private let bodyPipeline = BodyPipeline()
     private let recorder = PoseRecorder()
     private var generation = 0
@@ -107,6 +111,7 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
     func setMode(_ value: AppMode) { mode = value; start() }
     func setBackend(_ value: BodyBackend) { backend = value; start() }
     func stop() {
+        stopStreaming()
         running = false; generation += 1; session.pause()
         bodySnapshot = nil; renderFrame = nil; debug = nil; cachedTransform = nil
         manualLandmarks = []; calibrationRecord = nil
@@ -115,6 +120,14 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
     func start() {
         stop()
         status = ""
+        if mode == .body {
+            backend = .vision
+            guard ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) else {
+                capabilities = "Body / Mannequin requires a LiDAR-equipped iPhone or iPad."
+                status = "LiDAR unavailable; measured body surfaces cannot start."
+                return
+            }
+        }
         let config: ARConfiguration
         if mode != .hand && backend == .arkit {
             guard ARBodyTrackingConfiguration.isSupported else {
@@ -153,6 +166,13 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
         do { recordingURL = try recorder.start(); recording = true }
         catch { status = error.localizedDescription }
     }
+    func startStreaming() {
+        streamCode = String(Int.random(in: 100000...999999))
+        poseStream.onStatus = { [weak self] in self?.streamStatus = $0 }
+        streaming = true
+        poseStream.start(code: streamCode)
+    }
+    func stopStreaming() { poseStream.stop(); streaming = false; streamCode = "" }
     func stopRecording() { recorder.stop(); recording = false }
     func deleteRecording() {
         stopRecording()
@@ -235,12 +255,13 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
         busy = true
         let token = generation
         if mode != .hand {
+            let surfaceMode = mode == .body
             let backend = self.backend, selection = self.selection, revision = selectionRevision
             let label = targetLabel, smoothing = self.smoothing
             visionQueue.async { [weak self] in
                 guard let self else { return }
                 let result = self.bodyPipeline.process(frame: frame, backend: backend, epoch: token,
-                    selection: selection, revision: revision, label: label, smoothing: smoothing)
+                    selection: selection, revision: revision, label: label, smoothing: smoothing, surfaceMode: surfaceMode)
                 DispatchQueue.main.async {
                     self.busy = false
                     guard self.running, token == self.generation else { return }
@@ -271,6 +292,7 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
                         enriched = snapshot
                     }
                     self.bodySnapshot = enriched
+                    if self.streaming, let snapshot = enriched { self.poseStream.send(snapshot) }
                     if self.recording, let result = enriched {
                         self.recorder.enqueue(result,captureImages: self.captureImages) { error in
                             self.stopRecording(); self.status = "Recording stopped: \(error.localizedDescription)"

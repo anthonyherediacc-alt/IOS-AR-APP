@@ -27,8 +27,13 @@ struct BodyTrackingView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 8) {
-                Picker("Backend", selection: Binding(get: { session.backend }, set: { session.setBackend($0) })) {
-                    ForEach(BodyBackend.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                if session.mode == .diagnostics {
+                    Picker("Backend", selection: Binding(get: { session.backend }, set: { session.setBackend($0) })) {
+                        ForEach(BodyBackend.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                    }
+                } else {
+                    Text("On-device AI + LiDAR surface mesh").font(.headline)
+                    Text("Tap the body or mannequin. Move slowly around it; keep the target still. AI isolates the tapped foreground object; it does not certify that the object is a mannequin. Unseen surfaces remain unscanned.").font(.caption)
                 }
                 Text(session.capabilities).font(.caption)
                 if !session.status.isEmpty { Text(session.status).font(.caption).foregroundStyle(.orange) }
@@ -46,18 +51,23 @@ struct BodyTrackingView: View {
                         }
                     }
                 } else { Text("Waiting for frames. \(session.status)").frame(height: 200) }
+                if session.mode == .diagnostics {
                 Toggle("Raw 2D landmarks", isOn: $showRaw)
                 Toggle("3D estimates projected with matching camera", isOn: $showWorld)
                 Toggle("Filtered estimates", isOn: $showFiltered)
                 Toggle("Inferred capsule envelope", isOn: $envelope)
                 Toggle("Anatomical joint names", isOn: $showNames)
+                }
                 Toggle("Depth image (0–5 m grayscale)", isOn: $showDepth)
                 Toggle("Confidence image (black low / gray medium / white high)", isOn: $showConfidence)
+                if session.mode == .diagnostics {
                 Text("Smoothing time constant: \(session.smoothing, specifier: "%.2f") s; introduces lag")
                 Slider(value: $session.smoothing, in: 0...0.5)
+                }
                 Picker("Operator target label", selection: $session.targetLabel) {
                     Text("Mannequin").tag("mannequin"); Text("Human").tag("human"); Text("Unknown").tag("unknown")
                 }
+                if session.mode == .diagnostics {
                 Picker("Diagnostic attachment", selection: $session.attachmentJoint) {
                     ForEach((session.bodySnapshot?.packet.joints.map { $0.name } ?? names), id: \.self) { Text($0).tag($0) }
                 }
@@ -72,8 +82,17 @@ struct BodyTrackingView: View {
                 Button("Import reference landmarks and fit rigid registration") { importing = true }
                 Button("Invalidate manual alignment (target/limb moved)") { manual = [:]; session.manualLandmarks = []; session.calibrationRecord = nil; calibration = "Invalidated by operator" }
                 Text(notice).font(.caption)
+                }
                 Divider()
                 Toggle("Opt in: save RGB + depth (1 fps, local, max 100 MB)", isOn: $session.captureImages)
+                Button(session.streaming ? "Stop Unity stream" : "Start Unity stream (USB / Wi-Fi)") {
+                    if session.streaming { session.stopStreaming() } else { session.startStreaming() }
+                }
+                Text(session.streamStatus).font(.caption)
+                if session.streaming {
+                    Text("Unity pairing code: \(session.streamCode) • TCP 8765").monospaced()
+                    Text("USB: run iproxy on the computer; connect Unity to localhost:8765. Sends the selected surface mesh and tracking state; no RGB. Wi-Fi is optional on a trusted network.").font(.caption)
+                }
                 Button(session.recording ? "Stop recording" : "Start pose recording") {
                     if session.recording { session.stopRecording() } else { session.startRecording() }
                 }
@@ -136,6 +155,17 @@ struct BodyTrackingView: View {
                         let p = snapshot.camera.projectPoint(SIMD3(w[0],w[1],w[2]),orientation:.landscapeRight,
                                                              viewportSize:snapshot.camera.imageResolution)
                         return [Float(p.x/snapshot.camera.imageResolution.width),Float(p.y/snapshot.camera.imageResolution.height)]
+                    }
+                    let mesh = snapshot.mesh
+                    if mesh.status == "tracking" {
+                        let projected = mesh.vertices.map { display(worldUV([$0.x,$0.y,$0.z])) }
+                        for i in stride(from:0,to:mesh.triangles.count,by:3) {
+                            let a=mesh.triangles[i], b=mesh.triangles[i+1], c=mesh.triangles[i+2]
+                            guard a<projected.count, b<projected.count, c<projected.count else { continue }
+                            var triangle=Path(); triangle.move(to:projected[a]); triangle.addLine(to:projected[b]); triangle.addLine(to:projected[c]); triangle.closeSubpath()
+                            context.fill(triangle,with:.color(.green.opacity(0.22)))
+                            context.stroke(triangle,with:.color(.green.opacity(0.6)),lineWidth:0.3)
+                        }
                     }
                     for landmark in session.manualLandmarks {
                         let uv = worldUV(landmark.world); dot(uv,color:.gray,radius:5)

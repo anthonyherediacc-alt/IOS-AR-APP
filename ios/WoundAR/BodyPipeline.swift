@@ -4,7 +4,7 @@ import UIKit
 import CoreImage
 
 enum AppMode: String, CaseIterable { case hand = "Hand Wound Demo", body = "Body / Mannequin", diagnostics = "Depth / Diagnostics" }
-enum BodyBackend: String, CaseIterable { case vision = "Vision 2D + depth", arkit = "ARKit body 3D" }
+enum BodyBackend: String, CaseIterable { case vision = "LiDAR surfaces + Vision landmarks", arkit = "ARKit skeleton (no LiDAR)" }
 
 struct BodySnapshot {
     var image: UIImage
@@ -17,6 +17,8 @@ struct BodySnapshot {
     var sensorSize: SIMD2<Float>
     var depth: ARDepthData?
     var message: String
+    var surface: [SurfacePoint] = []
+    var mesh = TargetSurface()
 }
 
 protocol BodyDetector {
@@ -69,6 +71,7 @@ final class ARKitBodyDetector: BodyDetector {
 
 // All accesses occur on WoundSession's serial inference queue.
 final class BodyPipeline {
+    private let surfacePipeline = TargetSurfacePipeline()
     private let vision = VisionBodyDetector()
     private let arkit = ARKitBodyDetector()
     private let context = CIContext()
@@ -82,7 +85,8 @@ final class BodyPipeline {
     private var selectionRevision = -1
 
     func process(frame: ARFrame, backend: BodyBackend, epoch: Int, selection: SIMD2<Float>?,
-                 revision: Int, label: String, smoothing: Double) -> BodySnapshot? {
+                 revision: Int, label: String, smoothing: Double, surfaceMode: Bool = false) -> BodySnapshot? {
+        if surfaceMode { return processSurface(frame:frame,epoch:epoch,selection:selection,revision:revision,label:label) }
         let start = ProcessInfo.processInfo.systemUptime
         if self.epoch != epoch {
             lock = TargetLock(); filtered = [:]; lastTime = nil; anchorID = nil
@@ -114,10 +118,14 @@ final class BodyPipeline {
                 for (name,a,b) in [("chest","leftShoulder","rightShoulder"),("pelvis","leftHip","rightHip")] {
                     guard let p = points.first(where: { $0.name == a }), let q = points.first(where: { $0.name == b }),
                           let u = p.image, let v = q.image else { continue }
-                    let world: [Float]?
-                    if let x = p.world, let y = q.world { world = zip(x,y).map { ($0+$1)/2 } } else { world = nil }
-                    output.append(TrackedPoint(name:name,image:zip(u,v).map { ($0+$1)/2 },world:world,
-                        provenance:"derivedMidpoint",reason:"derived from \(a) and \(b); not a measured joint"))
+                    let uv = SIMD2<Float>((u[0]+v[0])/2,(u[1]+v[1])/2)
+                    let world = depth.flatMap { Self.sample($0, uv: uv) }.flatMap {
+                        TrackingGeometry.unproject(uv: uv, depth: $0, size: size,
+                            intrinsics: frame.camera.intrinsics, camera: frame.camera.transform)
+                    }
+                    output.append(TrackedPoint(name:name,image:[uv.x,uv.y],world:world.map(TrackingGeometry.array),
+                        provenance:world == nil ? "derived2DMidpoint" : "derived2DMidpoint+depthSurface",
+                        reason:"image midpoint of \(a) and \(b); 3D requires measured depth at that pixel"))
                 }
                 return output
             }
@@ -188,6 +196,7 @@ final class BodyPipeline {
         }
         if lock.requiresSelection, lock.id != nil { message = "Identity uncertain/lost. Explicitly reselect; no automatic switch to trainee." }
         else if !joints.isEmpty { message = backend == .vision ? "Surface samples ≠ skeletal centers. Automatic mannequin recognition unvalidated." : "ARKit inferred skeleton; tracking flags are not probabilities." }
+        if backend == .vision, depth == nil { message = "Waiting for LiDAR depth. 2D landmarks only; no measured 3D attachment." }
         let packet = TrackingPacket(sessionID: sessionID, frameID: frameID, timestamp: frame.timestamp,
             worldOriginEpoch: epoch, backend: backend.rawValue, targetID: lock.id, targetLabel: label,
             state: lock.state, observationAge: lock.lastSeen.map { frame.timestamp - $0 },
@@ -196,7 +205,41 @@ final class BodyPipeline {
         guard let cg = context.createCGImage(CIImage(cvPixelBuffer: frame.capturedImage), from: CGRect(x: 0,y: 0,width: CGFloat(size.x),height: CGFloat(size.y))) else { return nil }
         return BodySnapshot(image: UIImage(cgImage: cg, scale: 1, orientation: .right), depthImage: depth.flatMap { depthPreview($0) },
                             confidenceImage: depth.flatMap { $0.confidenceMap }.flatMap { confidencePreview($0) },
-                            packet: packet, candidates: candidates, centers: centers, camera: frame.camera, sensorSize: size, depth: depth, message: message)
+                            packet: packet, candidates: candidates, centers: centers, camera: frame.camera, sensorSize: size, depth: depth, message: message,
+                            surface: Self.surfaceSamples(depth, frame: frame, size: size))
+    }
+
+    private func processSurface(frame: ARFrame, epoch: Int, selection: SIMD2<Float>?, revision: Int, label: String) -> BodySnapshot? {
+        let start=ProcessInfo.processInfo.systemUptime
+        let mesh=surfacePipeline.process(frame:frame,epoch:epoch,selection:selection,revision:revision)
+        frameID += 1
+        let size=SIMD2<Float>(Float(CVPixelBufferGetWidth(frame.capturedImage)),Float(CVPixelBufferGetHeight(frame.capturedImage)))
+        guard let cg=context.createCGImage(CIImage(cvPixelBuffer:frame.capturedImage),from:CGRect(x:0,y:0,width:CGFloat(size.x),height:CGFloat(size.y))) else { return nil }
+        let packet=TrackingPacket(sessionID:sessionID,frameID:frameID,timestamp:frame.timestamp,
+            worldOriginEpoch:epoch,backend:"onDeviceForegroundAI+LiDAR",targetID:mesh.targetID,targetLabel:label,
+            state:mesh.status,cameraPose:TrackingGeometry.matrix(frame.camera.transform),joints:[],events:[],
+            inferenceMS:(ProcessInfo.processInfo.systemUptime-start)*1000,smoothingTimeConstant:0)
+        let message = mesh.status == "tracking"
+            ? "\(mesh.triangles.count/3) LiDAR surface triangles. Green mesh is the selected foreground object. Verify that it excludes the room and other people."
+            : "\(mesh.status): tap inside the body or mannequin to select its AI foreground mask."
+        return BodySnapshot(image:UIImage(cgImage:cg,scale:1,orientation:.right),
+            depthImage:frame.sceneDepth.flatMap { depthPreview($0) },
+            confidenceImage:frame.sceneDepth.flatMap { $0.confidenceMap }.flatMap { confidencePreview($0) },
+            packet:packet,candidates:[],centers:[],camera:frame.camera,sensorSize:size,depth:frame.sceneDepth,
+            message:message,mesh:mesh)
+    }
+
+    private static func surfaceSamples(_ depth: ARDepthData?, frame: ARFrame, size: SIMD2<Float>) -> [SurfacePoint] {
+        guard let depth, case .normal = frame.camera.trackingState else { return [] }
+        var points: [SurfacePoint] = []
+        // Bounded same-frame scene cloud; confidence and discontinuity gates match landmarks.
+        for y in 0..<16 { for x in 0..<20 {
+            let uv = SIMD2<Float>((Float(x)+0.5)/20,(Float(y)+0.5)/16)
+            guard let d = sample(depth, uv: uv), let w = TrackingGeometry.unproject(uv: uv, depth: d,
+                size: size, intrinsics: frame.camera.intrinsics, camera: frame.camera.transform) else { continue }
+            points.append(SurfacePoint(x:w.x,y:w.y,z:w.z))
+        }}
+        return points
     }
 
     static func sample(_ depth: ARDepthData, uv: SIMD2<Float>) -> Float? {
