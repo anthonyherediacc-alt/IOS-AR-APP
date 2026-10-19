@@ -35,3 +35,9 @@ skin, other-hand covering, depth hiding, skin blending — and a debug view of e
 Code: `WoundAR/WoundSession.swift` (pipeline), `WoundAR/SurfaceTracker.swift` (skin mesh), `WoundAR/Renderer.swift` +
 `WoundAR/Shaders.metal` (drawing), `WoundAR/HandMath.swift` (1€ filter, solver, affine map, skin flow, depth helpers),
 `project.yml` (XcodeGen; the Xcode project is generated in CI).
+# Version 0.2: AI-isolated LiDAR surfaces and USB streaming
+
+Body / Mannequin now uses on-device foreground-instance segmentation and measured LiDAR depth to build the tapped target's visible surface mesh. It requires LiDAR. The old skeleton tools remain under Depth / Diagnostics; the hand demo is preserved.
+
+See [USB surface stream setup](../integration/USB-SURFACE-STREAM.md) for the desktop Unity receiver, `iproxy` setup, protocol and limitations. This is a live visible-surface mesh, not a fused full-body scan. Generic foreground segmentation is not a validated mannequin classifier. No cloud inference is used.
+

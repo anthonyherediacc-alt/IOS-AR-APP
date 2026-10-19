@@ -36,7 +36,7 @@ final class PoseStream {
         onStatus?("Stopped")
     }
     private func accept(_ connection: NWConnection) {
-        guard client == nil else { connection.cancel(); return }
+        guard listener != nil, client == nil else { connection.cancel(); return }
         client = connection; authorized = false; sending = false; awaitingAck=false
         connection.stateUpdateHandler = { [weak self, weak connection] state in
             guard let self, let connection, self.client === connection else { return }
@@ -75,7 +75,7 @@ final class PoseStream {
                 guard String(data: buffer.prefix(upTo: newline), encoding: .utf8) == self.code,
                       newline == buffer.count-1 else { self.disconnect(connection); return }
                 self.authorized = true; self.lastSent = -.infinity
-                self.onStatus?("Connected • streaming pose + LiDAR samples at up to 10 Hz")
+                self.onStatus?("Connected • streaming LiDAR mesh + status at up to 10 Hz")
                 self.receive(connection, bytes: Data())
             } else if buffer.count > 64 { self.disconnect(connection) }
             else { self.receive(connection, bytes: buffer) }
