@@ -135,7 +135,7 @@ struct RigidFit {
         }
         guard spread(a), spread(b) else { return nil }
         let ca = a.reduce(.zero, +) / Float(a.count), cb = b.reduce(.zero, +) / Float(b.count)
-        var s = simd_float3x3(repeating: 0)
+        var s = simd_float3x3(0)
         var aa: Float = 0, bb: Float = 0
         for i in a.indices {
             let x = a[i] - ca, y = b[i] - cb

@@ -47,7 +47,8 @@ final class VisionBodyDetector: BodyDetector {
 
 final class ARKitBodyDetector: BodyDetector {
     func detect(frame: ARFrame) throws -> [[TrackedPoint]] {
-        frame.anchors.compactMap { $0 as? ARBodyAnchor }.filter { $0.isTracked }.map { anchor in
+        let bodies: [ARBodyAnchor] = frame.anchors.compactMap { anchor -> ARBodyAnchor? in anchor as? ARBodyAnchor }
+        return bodies.filter { $0.isTracked }.map { anchor in
             let skeleton = anchor.skeleton
             return skeleton.definition.jointNames.enumerated().map { i, name in
                 let world = anchor.transform * skeleton.jointModelTransforms[i]
@@ -142,7 +143,8 @@ final class BodyPipeline {
         var joints = index.map { candidates[$0] } ?? []
         var root: [Float]?
         if backend == .arkit, let index {
-            let anchors = frame.anchors.compactMap { $0 as? ARBodyAnchor }.filter { $0.isTracked }
+            let bodies: [ARBodyAnchor] = frame.anchors.compactMap { anchor -> ARBodyAnchor? in anchor as? ARBodyAnchor }
+            let anchors = bodies.filter { $0.isTracked }
             if index < anchors.count {
                 let anchor = anchors[index]
                 if let anchorID, anchorID != anchor.identifier {

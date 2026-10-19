@@ -1,5 +1,10 @@
 # Wound AR — native iPhone app (LiDAR)
 
+Experimental Body / Mannequin and Depth / Diagnostics modes are documented in [TRACKING.md](TRACKING.md).
+The original hand demo remains available. Body 2D diagnostics can run without LiDAR; depth and
+ARKit body tracking are checked independently on the device. Automatic mannequin tracking is
+not yet physically validated. See the linked guide for recording, Unity export and acceptance tests.
+
 Same idea as the web app, but uses the iPhone's LiDAR depth so the wound sits on the measured skin, is
 covered by the other hand (or anything closer to the camera), is cut off where the hand ends, and is
 darkened/brightened to match the skin's brightness.
