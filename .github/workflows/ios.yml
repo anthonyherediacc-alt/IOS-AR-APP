@@ -3,7 +3,9 @@
 name: iOS app (unsigned IPA)
 on:
   push:
-    paths: ["ios/**", ".github/workflows/ios.yml"]
+    paths: ["ios/**", "integration/**", "tools/**", ".github/workflows/ios.yml"]
+  pull_request:
+    paths: ["ios/**", "integration/**", "tools/**", ".github/workflows/ios.yml"]
   workflow_dispatch:
 jobs:
   build:
@@ -13,6 +15,14 @@ jobs:
         working-directory: ios
     steps:
       - uses: actions/checkout@v4
+      - name: Toolchain versions
+        run: xcodebuild -version && swift --version
+      - name: Geometry, identity and serialization tests
+        run: swift test 2>&1 | tee tracking-tests.log
+      - name: Evaluation harness tests
+        run: node --test ../tools/evaluate.test.mjs
+      - name: Offline image inference tool typecheck
+        run: swiftc -typecheck ../tools/infer-images.swift
       - run: brew install xcodegen
       - run: xcodegen generate
       - name: Build (no code signing)

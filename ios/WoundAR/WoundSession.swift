@@ -82,6 +82,83 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
         didSet { applySettingsToRenderer() }
     }
     @Published var debug: DebugInfo?
+    @Published var mode: AppMode = .hand
+    @Published var backend: BodyBackend = .vision
+    @Published var bodySnapshot: BodySnapshot?
+    @Published var capabilities = ""
+    @Published var targetLabel = "mannequin"
+    @Published var smoothing: Double = 0
+    @Published var recording = false
+    @Published var recordingURL: URL?
+    @Published var attachmentJoint = "neck"
+    @Published var manualLandmarks: [ManualLandmark] = []
+    @Published var calibrationRecord: CalibrationRecord?
+    @Published var captureImages = false
+    private let bodyPipeline = BodyPipeline()
+    private let recorder = PoseRecorder()
+    private var generation = 0
+    private var running = false
+    private var selection: SIMD2<Float>?
+    private var selectionRevision = 0
+
+    func selectTarget(_ uv: SIMD2<Float>) {
+        selection = uv; selectionRevision += 1; manualLandmarks = []; calibrationRecord = nil
+    }
+    func setMode(_ value: AppMode) { mode = value; start() }
+    func setBackend(_ value: BodyBackend) { backend = value; start() }
+    func stop() {
+        running = false; generation += 1; session.pause()
+        bodySnapshot = nil; renderFrame = nil; debug = nil; cachedTransform = nil
+        manualLandmarks = []; calibrationRecord = nil
+        stopRecording()
+    }
+    func start() {
+        stop()
+        let config: ARConfiguration
+        if mode != .hand && backend == .arkit {
+            guard ARBodyTrackingConfiguration.isSupported else {
+                capabilities = "ARKit body tracking unavailable on this device"; return
+            }
+            config = ARBodyTrackingConfiguration()
+            capabilities = "ARKit body: active; scene depth/reconstruction: not requested"
+        } else {
+            guard ARWorldTrackingConfiguration.isSupported else { status = "World tracking unavailable"; return }
+            let world = ARWorldTrackingConfiguration()
+            var active: [String] = []
+            for semantic: ARConfiguration.FrameSemantics in [.sceneDepth, .smoothedSceneDepth] {
+                if ARWorldTrackingConfiguration.supportsFrameSemantics(semantic) {
+                    world.frameSemantics.insert(semantic)
+                    active.append(semantic == .sceneDepth ? "sceneDepth" : "smoothedSceneDepth")
+                }
+            }
+            config = world
+            capabilities = "Requested sceneDepth + smoothedSceneDepth; active: \(active.joined(separator: ", ")). Missing features unsupported. Reconstruction not requested."
+        }
+        capabilities = "\(UIDevice.current.model), iOS \(UIDevice.current.systemVersion)\n" + capabilities
+        selection = nil
+        visionQueue.async { [weak self] in
+            self?.reset(); self?.tracker.reset(); self?.previousPyramid = nil
+            self?.lastJoints = []; self?.opacity = 0; self?.bridgeConfidence = 0; self?.lumaSeeded = false
+        }
+        running = true
+        session.delegate = self
+        session.delegateQueue = .main
+        session.run(config, options: [.resetTracking, .removeExistingAnchors])
+    }
+    func sessionWasInterrupted(_ session: ARSession) { stop(); status = "Camera interrupted" }
+    func sessionInterruptionEnded(_ session: ARSession) { start() }
+    func session(_ session: ARSession, didFailWithError error: Error) { stop(); status = error.localizedDescription }
+    func startRecording() {
+        do { recordingURL = try recorder.start(); recording = true }
+        catch { status = error.localizedDescription }
+    }
+    func stopRecording() { recorder.stop(); recording = false }
+    func deleteRecording() {
+        stopRecording()
+        guard let url = recordingURL else { return }
+        do { try FileManager.default.removeItem(at: url.deletingLastPathComponent()); recordingURL = nil }
+        catch { status = error.localizedDescription }
+    }
 
     let session = ARSession()
     private(set) var renderFrame: RenderFrame? // main thread
@@ -131,12 +208,7 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
            let cg = UIImage(contentsOfFile: url.path)?.cgImage {
             placement.aspect = Float(cg.height) / Float(cg.width)
         }
-        let config = ARWorldTrackingConfiguration()
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
-            config.frameSemantics.insert(.smoothedSceneDepth)
-        }
-        session.delegate = self
-        session.run(config)
+        if !running { start() }
     }
 
     private func applySettingsToRenderer() {
@@ -158,8 +230,55 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
     // MARK: ARSessionDelegate (main thread)
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        guard !busy else { return }
+        guard running, !busy else { return }
         busy = true
+        let token = generation
+        if mode != .hand {
+            let backend = self.backend, selection = self.selection, revision = selectionRevision
+            let label = targetLabel, smoothing = self.smoothing
+            visionQueue.async { [weak self] in
+                guard let self else { return }
+                let result = self.bodyPipeline.process(frame: frame, backend: backend, epoch: token,
+                    selection: selection, revision: revision, label: label, smoothing: smoothing)
+                DispatchQueue.main.async {
+                    self.busy = false
+                    guard self.running, token == self.generation else { return }
+                    var enriched = result
+                    if var snapshot = enriched {
+                        // A static assisted alignment must not survive observed target/limb movement.
+                        let moved = self.manualLandmarks.contains { landmark in
+                            guard let w = snapshot.packet.joints.first(where: { $0.name == landmark.name })?.world else { return false }
+                            return simd_distance(SIMD3(w[0],w[1],w[2]),SIMD3(landmark.world[0],landmark.world[1],landmark.world[2])) > 0.10
+                        }
+                        if moved {
+                            self.manualLandmarks = []; self.calibrationRecord = nil
+                            snapshot.packet.events.append("staticCalibrationInvalidated:observedMotion")
+                        }
+                        snapshot.packet.manualLandmarks = self.manualLandmarks
+                        snapshot.packet.calibration = self.calibrationRecord
+                        snapshot.packet.calibrationID = self.calibrationRecord?.id
+                        let point = snapshot.packet.joints.first { $0.name == self.attachmentJoint }
+                        var local: [Float]?
+                        if let w = point?.world, let matrix = snapshot.packet.bodyRootPose, matrix.count == 16 {
+                            let columns = (0..<4).map { c in SIMD4<Float>(matrix[c*4],matrix[c*4+1],matrix[c*4+2],matrix[c*4+3]) }
+                            let root = simd_float4x4(columns: (columns[0],columns[1],columns[2],columns[3]))
+                            let p = root.inverse * SIMD4<Float>(w[0],w[1],w[2],1)
+                            local = [p.x,p.y,p.z]
+                        }
+                        snapshot.packet.attachment = AttachmentRecord(joint: self.attachmentJoint,world: point?.world,
+                            bodyLocal: local,provenance: point?.provenance ?? "unavailable")
+                        enriched = snapshot
+                    }
+                    self.bodySnapshot = enriched
+                    if self.recording, let result = enriched {
+                        self.recorder.enqueue(result,captureImages: self.captureImages) { error in
+                            self.stopRecording(); self.status = "Recording stopped: \(error.localizedDescription)"
+                        }
+                    }
+                }
+            }
+            return
+        }
         let image = frame.capturedImage
         let depth = frame.smoothedSceneDepth?.depthMap ?? frame.sceneDepth?.depthMap
         let time = frame.timestamp
@@ -168,6 +287,8 @@ final class WoundSession: NSObject, ObservableObject, ARSessionDelegate {
             guard let self else { return }
             let output = self.process(image: image, depth: depth, time: time, settings: settings)
             DispatchQueue.main.async {
+                self.busy = false
+                guard self.running, token == self.generation else { return }
                 if self.status != output.status { self.status = output.status }
                 self.renderFrame = output.frame
                 if settings.debug, self.settings.debug { self.debug = output.debug }
